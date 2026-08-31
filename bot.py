@@ -284,6 +284,82 @@ async def fetch_last_ranked_match(puuid: str, region: str) -> dict | None:
         logging.warning(f"Could not fetch match details for puuid {puuid}", exc_info=True)
         return None
 
+ROLE_DISPLAY = {
+    "TOP": "Top",
+    "JUNGLE": "Jungle",
+    "MIDDLE": "Mid",
+    "BOTTOM": "Bot",
+    "UTILITY": "Support",
+}
+
+# How many recent ranked games to analyze for /lp's "top champions" section.
+# Each game costs 1 Riot API call, so this directly trades off /lp's cost
+# and latency against how representative the stats are.
+CHAMPION_STATS_GAME_COUNT = int(os.getenv("CHAMPION_STATS_GAME_COUNT", "10"))
+
+async def _fetch_match_participant(match_id: str, regional: str, headers: dict, puuid: str):
+    match_url = f"https://{regional}.api.riotgames.com/lol/match/v5/matches/{match_id}"
+    resp = await asyncio.to_thread(requests.get, match_url, headers=headers)
+    if not resp.ok:
+        return None
+    match_data = resp.json()
+    return next((p for p in match_data["info"]["participants"] if p["puuid"] == puuid), None)
+
+async def fetch_recent_champion_stats(puuid: str, region: str) -> dict | None:
+    """Aggregate top champions and most-played role over the player's last
+    CHAMPION_STATS_GAME_COUNT Ranked Solo/Duo games. Returns None (never
+    raises) if this can't be computed — treated as optional flavor for /lp."""
+    regional = PLATFORM_TO_REGIONAL[region]
+    headers = {"X-Riot-Token": RIOT_API_KEY}
+    try:
+        ids_url = (
+            f"https://{regional}.api.riotgames.com/lol/match/v5/matches/by-puuid/"
+            f"{puuid}/ids?queue=420&start=0&count={CHAMPION_STATS_GAME_COUNT}"
+        )
+        ids_resp = requests.get(ids_url, headers=headers)
+        ids_resp.raise_for_status()
+        match_ids = ids_resp.json()
+        if not match_ids:
+            return None
+
+        participants = await asyncio.gather(
+            *[_fetch_match_participant(mid, regional, headers, puuid) for mid in match_ids]
+        )
+        participants = [p for p in participants if p is not None]
+        if not participants:
+            return None
+
+        champ_stats = {}  # champion_key -> [games, wins]
+        role_counts = {}
+        for p in participants:
+            champ = p["championName"]
+            games, wins = champ_stats.get(champ, (0, 0))
+            champ_stats[champ] = (games + 1, wins + (1 if p["win"] else 0))
+
+            role = p.get("teamPosition") or "UNKNOWN"
+            role_counts[role] = role_counts.get(role, 0) + 1
+
+        top_champs = sorted(champ_stats.items(), key=lambda kv: kv[1][0], reverse=True)[:3]
+        top_champs_display = []
+        for champ_key, (games, wins) in top_champs:
+            display_name = await get_champion_display_name(champ_key)
+            wr = (wins / games) * 100 if games else 0
+            top_champs_display.append(f"{display_name} — {games}g, {wr:.0f}% WR")
+
+        top_role = None
+        if role_counts:
+            top_role_key = max(role_counts.items(), key=lambda kv: kv[1])[0]
+            top_role = ROLE_DISPLAY.get(top_role_key, top_role_key.title())
+
+        return {
+            "top_champions": top_champs_display,
+            "top_role": top_role,
+            "games_analyzed": len(participants),
+        }
+    except Exception:
+        logging.warning(f"Could not fetch champion stats for puuid {puuid}", exc_info=True)
+        return None
+
 def get_rank_emoji(rank):
     emoji_dict = {
         "IRON": "🛡️ Iron",
@@ -362,16 +438,28 @@ async def lp(interaction: discord.Interaction, name: str, region: str = "na1"):
         name=f"{name} ({region.upper()})",
         icon_url=get_profile_icon_url(data["profile_icon_id"]) if data.get("profile_icon_id") else None
     )
-    embed.add_field(name="Wins", value=f"{data['wins']} - {data['losses']}", inline=True)
+
+    champ_stats = await fetch_recent_champion_stats(data["puuid"], region)
+
+    embed.add_field(name="Record", value=f"{data['wins']}W - {data['losses']}L", inline=True)
     embed.add_field(name="Win Rate", value=f"{data['wr']:.1f}%", inline=True)
+    embed.add_field(name="Main Role", value=champ_stats["top_role"] if champ_stats and champ_stats["top_role"] else "—", inline=True)
+
+    if champ_stats and champ_stats["top_champions"]:
+        embed.add_field(
+            name="Top Champions",
+            value="\n".join(champ_stats["top_champions"]),
+            inline=False
+        )
+        embed.set_footer(text=f"Champion stats based on last {champ_stats['games_analyzed']} ranked games")
 
     try:
         emblem_file, emblem_filename = await get_cropped_emblem_file(data['tier'])
-        embed.set_image(url=f"attachment://{emblem_filename}")
+        embed.set_thumbnail(url=f"attachment://{emblem_filename}")
         await interaction.followup.send(embed=embed, file=emblem_file)
     except Exception:
         logging.exception("Could not crop emblem image, falling back to raw URL")
-        embed.set_image(url=get_rank_emblem_url(data['tier']))
+        embed.set_thumbnail(url=get_rank_emblem_url(data['tier']))
         await interaction.followup.send(embed=embed)
 
 # ==================== REGISTRATION ====================
