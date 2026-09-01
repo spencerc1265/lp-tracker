@@ -156,11 +156,9 @@ async def fetch_profile_icon_id(puuid: str, region: str) -> int | None:
         logging.warning("Could not fetch profile icon", exc_info=True)
     return None
 
-async def fetch_ranked_solo(name: str, region: str, fetch_icon: bool = False) -> dict:
-    """Look up a Riot ID's Ranked Solo/Duo entry.
-    Raises LPLookupError with a user-facing message on expected failures.
-    If fetch_icon is True, also fetches the summoner's profile icon ID
-    (costs one extra Riot API call — skip it for bulk lookups like the leaderboard)."""
+async def fetch_puuid(name: str, region: str) -> str:
+    """Resolve a Riot ID (GameName#Tag) to a puuid. Raises LPLookupError
+    with a user-facing message on a bad region/format or unknown Riot ID."""
     region = region.lower()
     if region not in VALID_PLATFORMS:
         raise LPLookupError(f"Unknown region '{region}'. Valid options: {', '.join(sorted(VALID_PLATFORMS))}")
@@ -174,7 +172,6 @@ async def fetch_ranked_solo(name: str, region: str, fetch_icon: bool = False) ->
     regional = PLATFORM_TO_REGIONAL[region]
     headers = {"X-Riot-Token": RIOT_API_KEY}
 
-    # 1. Riot ID -> PUUID (Account-V1, regional routing)
     account_url = (
         f"https://{regional}.api.riotgames.com/riot/account/v1/accounts/"
         f"by-riot-id/{game_name}/{tag_line}"
@@ -183,13 +180,23 @@ async def fetch_ranked_solo(name: str, region: str, fetch_icon: bool = False) ->
     if account_resp.status_code == 404:
         raise LPLookupError(f"Riot ID '{name}' not found.")
     account_resp.raise_for_status()
-    puuid = account_resp.json()["puuid"]
+    return account_resp.json()["puuid"]
+
+async def fetch_ranked_solo(name: str, region: str, fetch_icon: bool = False) -> dict:
+    """Look up a Riot ID's Ranked Solo/Duo entry.
+    Raises LPLookupError with a user-facing message on expected failures.
+    If fetch_icon is True, also fetches the summoner's profile icon ID
+    (costs one extra Riot API call — skip it for bulk lookups like the leaderboard)."""
+    region = region.lower()
+    headers = {"X-Riot-Token": RIOT_API_KEY}
+
+    puuid = await fetch_puuid(name, region)
 
     # Optional: profile icon ID (Summoner-V4 still returns this field, even
     # though it no longer returns the encrypted "id" summoner ID).
     profile_icon_id = await fetch_profile_icon_id(puuid, region) if fetch_icon else None
 
-    # 2. PUUID -> Ranked entries (League-V4, platform routing)
+    # PUUID -> Ranked entries (League-V4, platform routing)
     ranked_url = f"https://{region}.api.riotgames.com/lol/league/v4/entries/by-puuid/{puuid}"
     ranked_resp = requests.get(ranked_url, headers=headers)
     if ranked_resp.status_code == 404:
@@ -208,6 +215,17 @@ async def fetch_ranked_solo(name: str, region: str, fetch_icon: bool = False) ->
     losses = solo["losses"]
     wr = (wins / (wins + losses)) * 100 if wins + losses > 0 else 0
 
+    promo = None
+    mini_series = solo.get("miniSeries")
+    if mini_series:
+        icon_map = {"W": "🟢", "L": "🔴", "N": "⚪"}
+        promo = {
+            "wins": mini_series.get("wins", 0),
+            "losses": mini_series.get("losses", 0),
+            "target": mini_series.get("target", 0),
+            "progress_icons": "".join(icon_map.get(c, "⚪") for c in mini_series.get("progress", "")),
+        }
+
     return {
         "tier": solo["tier"],
         "division": solo.get("rank", ""),
@@ -217,13 +235,14 @@ async def fetch_ranked_solo(name: str, region: str, fetch_icon: bool = False) ->
         "wr": wr,
         "profile_icon_id": profile_icon_id,
         "puuid": puuid,
+        "promo": promo,
     }
 
 # ==================== CHAMPION NAMES & ICONS ====================
 _CHAMPION_DATA_CACHE = {}
 
 def _load_champion_data_sync():
-    """Fetch and cache championName (API key, e.g. 'MonkeyKing') -> {name, id}."""
+    """Fetch and cache championName (API key, e.g. 'MonkeyKing') -> {name, id, roles}."""
     if _CHAMPION_DATA_CACHE:
         return
     try:
@@ -238,7 +257,7 @@ def _load_champion_data_sync():
             name = champ.get("name")
             champ_id = champ.get("id")
             if alias and name:
-                _CHAMPION_DATA_CACHE[alias] = {"name": name, "id": champ_id}
+                _CHAMPION_DATA_CACHE[alias] = {"name": name, "id": champ_id, "roles": champ.get("roles", [])}
     except Exception:
         logging.warning("Could not load champion data list", exc_info=True)
 
@@ -256,6 +275,36 @@ async def get_champion_icon_url(champion_key: str) -> str | None:
         "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/"
         f"global/default/v1/champion-icons/{entry['id']}.png"
     )
+
+def get_champion_icon_url_by_id(champion_id: int) -> str:
+    """Champion-icon URL from a numeric champion ID directly — no cache
+    lookup needed, since the ID *is* the path segment."""
+    return (
+        "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/"
+        f"global/default/v1/champion-icons/{champion_id}.png"
+    )
+
+async def get_champion_by_id(champion_id: int) -> dict | None:
+    """Reverse lookup: numeric champion ID -> {name, id, roles}. Used for
+    APIs (Mastery-V4, Spectator-V5) that return IDs instead of string keys."""
+    await asyncio.to_thread(_load_champion_data_sync)
+    for entry in _CHAMPION_DATA_CACHE.values():
+        if entry.get("id") == champion_id:
+            return entry
+    return None
+
+async def find_champion_by_name(query: str) -> tuple[str, dict] | None:
+    """Look up a champion by display name or alias, case-insensitive.
+    Returns (alias, entry) or None if no unambiguous match is found."""
+    await asyncio.to_thread(_load_champion_data_sync)
+    normalized = query.strip().lower()
+    for alias, entry in _CHAMPION_DATA_CACHE.items():
+        if entry["name"].lower() == normalized or alias.lower() == normalized:
+            return alias, entry
+    candidates = [(alias, entry) for alias, entry in _CHAMPION_DATA_CACHE.items() if normalized in entry["name"].lower()]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
 
 # ==================== MATCH HISTORY (Match-V5) ====================
 async def fetch_last_ranked_match(puuid: str, region: str) -> dict | None:
@@ -448,6 +497,14 @@ async def lp(interaction: discord.Interaction, name: str, region: str = "na1"):
     embed.add_field(name="Win Rate", value=f"{data['wr']:.1f}%", inline=True)
     embed.add_field(name="Main Role", value=champ_stats["top_role"] if champ_stats and champ_stats["top_role"] else "—", inline=True)
 
+    if data.get("promo"):
+        promo = data["promo"]
+        embed.add_field(
+            name=f"Promotion Series (first to {promo['target']})",
+            value=f"{promo['progress_icons']} ({promo['wins']}W - {promo['losses']}L)",
+            inline=False
+        )
+
     if champ_stats and champ_stats["top_champions"]:
         embed.add_field(
             name="Top Champions",
@@ -464,6 +521,251 @@ async def lp(interaction: discord.Interaction, name: str, region: str = "na1"):
         logging.exception("Could not crop emblem image, falling back to raw URL")
         embed.set_thumbnail(url=get_rank_emblem_url(data['tier']))
         await interaction.followup.send(embed=embed)
+
+# ==================== EXTRA LOOKUPS ====================
+QUEUE_NAMES = {
+    400: "Normal (Draft)",
+    420: "Ranked Solo/Duo",
+    430: "Normal (Blind)",
+    440: "Ranked Flex",
+    450: "ARAM",
+    700: "Clash",
+    900: "ARURF",
+    1700: "Arena",
+}
+
+@tree.command(name="mastery", description="Show a player's top champions by mastery")
+@app_commands.describe(
+    name="Riot ID in the form GameName#Tag (e.g. 'Player#1234')",
+    region="Platform region (default na1): na1, euw1, eun1, kr, jp1, br1, la1, la2, oc1, tr1, ru"
+)
+async def mastery(interaction: discord.Interaction, name: str, region: str = "na1"):
+    await interaction.response.defer(thinking=True)
+
+    if not RIOT_API_KEY:
+        await interaction.followup.send("❌ No RIOT_API_KEY found!")
+        return
+
+    try:
+        puuid = await fetch_puuid(name, region)
+    except LPLookupError as e:
+        await interaction.followup.send(f"❌ {e}")
+        return
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        await interaction.followup.send(f"❌ Riot API error ({status}). Try again shortly.")
+        return
+
+    headers = {"X-Riot-Token": RIOT_API_KEY}
+    try:
+        url = (
+            f"https://{region.lower()}.api.riotgames.com/lol/champion-mastery/v4/"
+            f"champion-masteries/by-puuid/{puuid}/top?count=5"
+        )
+        resp = requests.get(url, headers=headers)
+        resp.raise_for_status()
+        top = resp.json()
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        await interaction.followup.send(f"❌ Riot API error ({status}). Try again shortly.")
+        return
+    except Exception as e:
+        logging.exception("Unexpected error in /mastery")
+        await interaction.followup.send(f"❌ Error: {str(e)}")
+        return
+
+    if not top:
+        await interaction.followup.send(f"❌ No champion mastery data found for '{name}'.")
+        return
+
+    lines = []
+    for entry in top:
+        champ = await get_champion_by_id(entry["championId"])
+        champ_name = champ["name"] if champ else f"Champion {entry['championId']}"
+        lines.append(f"**{champ_name}** — Level {entry['championLevel']} • {entry['championPoints']:,} pts")
+
+    embed = discord.Embed(
+        title=f"{name} — Top Champions by Mastery",
+        description="\n".join(lines),
+        color=0x9B59B6
+    )
+    top_champ = await get_champion_by_id(top[0]["championId"])
+    if top_champ:
+        embed.set_thumbnail(url=get_champion_icon_url_by_id(top_champ["id"]))
+
+    await interaction.followup.send(embed=embed)
+
+@tree.command(name="livegame", description="Check if a player is currently in a game")
+@app_commands.describe(
+    name="Riot ID in the form GameName#Tag (e.g. 'Player#1234')",
+    region="Platform region (default na1): na1, euw1, eun1, kr, jp1, br1, la1, la2, oc1, tr1, ru"
+)
+async def livegame(interaction: discord.Interaction, name: str, region: str = "na1"):
+    await interaction.response.defer(thinking=True)
+
+    if not RIOT_API_KEY:
+        await interaction.followup.send("❌ No RIOT_API_KEY found!")
+        return
+
+    try:
+        puuid = await fetch_puuid(name, region)
+    except LPLookupError as e:
+        await interaction.followup.send(f"❌ {e}")
+        return
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        await interaction.followup.send(f"❌ Riot API error ({status}). Try again shortly.")
+        return
+
+    headers = {"X-Riot-Token": RIOT_API_KEY}
+    region = region.lower()
+    try:
+        url = f"https://{region}.api.riotgames.com/lol/spectator/v5/active-games/by-summoner/{puuid}"
+        resp = requests.get(url, headers=headers)
+        if resp.status_code == 404:
+            await interaction.followup.send(f"💤 **{name}** is not currently in a game.")
+            return
+        resp.raise_for_status()
+        game_data = resp.json()
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        await interaction.followup.send(f"❌ Riot API error ({status}). Try again shortly.")
+        return
+    except Exception as e:
+        logging.exception("Unexpected error in /livegame")
+        await interaction.followup.send(f"❌ Error: {str(e)}")
+        return
+
+    participant = next((p for p in game_data.get("participants", []) if p.get("puuid") == puuid), None)
+    if not participant:
+        await interaction.followup.send(f"💤 **{name}** is not currently in a game.")
+        return
+
+    champ = await get_champion_by_id(participant["championId"])
+    champ_name = champ["name"] if champ else f"Champion {participant['championId']}"
+    queue_name = QUEUE_NAMES.get(game_data.get("gameQueueConfigId"), "Custom/Other")
+    mins, secs = divmod(max(game_data.get("gameLength", 0), 0), 60)
+
+    embed = discord.Embed(
+        title=f"🔴 {name} is LIVE",
+        description=f"Playing **{champ_name}** • {queue_name}\nGame time: {mins}:{secs:02d}",
+        color=0xE74C3C
+    )
+    embed.set_thumbnail(url=get_champion_icon_url_by_id(participant["championId"]))
+    await interaction.followup.send(embed=embed)
+
+@tree.command(name="freerotation", description="Show this week's free champion rotation")
+@app_commands.describe(region="Platform region (default na1)")
+async def freerotation(interaction: discord.Interaction, region: str = "na1"):
+    await interaction.response.defer(thinking=True)
+
+    if not RIOT_API_KEY:
+        await interaction.followup.send("❌ No RIOT_API_KEY found!")
+        return
+
+    region = region.lower()
+    if region not in VALID_PLATFORMS:
+        await interaction.followup.send(f"❌ Unknown region '{region}'. Valid options: {', '.join(sorted(VALID_PLATFORMS))}")
+        return
+
+    headers = {"X-Riot-Token": RIOT_API_KEY}
+    try:
+        url = f"https://{region}.api.riotgames.com/lol/platform/v3/champion-rotations"
+        resp = requests.get(url, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        await interaction.followup.send(f"❌ Riot API error ({status}). Try again shortly.")
+        return
+    except Exception as e:
+        logging.exception("Unexpected error in /freerotation")
+        await interaction.followup.send(f"❌ Error: {str(e)}")
+        return
+
+    champ_ids = data.get("freeChampionIds", [])
+    names = []
+    for cid in champ_ids:
+        champ = await get_champion_by_id(cid)
+        names.append(champ["name"] if champ else f"Champion {cid}")
+    names.sort()
+
+    embed = discord.Embed(
+        title="🔄 Free Champion Rotation",
+        description="\n".join(f"• {n}" for n in names) if names else "No rotation data available.",
+        color=0x1E90FF
+    )
+    await interaction.followup.send(embed=embed)
+
+@tree.command(name="serverstatus", description="Check League of Legends server status")
+@app_commands.describe(region="Platform region (default na1)")
+async def serverstatus(interaction: discord.Interaction, region: str = "na1"):
+    await interaction.response.defer(thinking=True)
+
+    if not RIOT_API_KEY:
+        await interaction.followup.send("❌ No RIOT_API_KEY found!")
+        return
+
+    region = region.lower()
+    if region not in VALID_PLATFORMS:
+        await interaction.followup.send(f"❌ Unknown region '{region}'. Valid options: {', '.join(sorted(VALID_PLATFORMS))}")
+        return
+
+    headers = {"X-Riot-Token": RIOT_API_KEY}
+    try:
+        url = f"https://{region}.api.riotgames.com/lol/status/v4/platform-data"
+        resp = requests.get(url, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        await interaction.followup.send(f"❌ Riot API error ({status}). Try again shortly.")
+        return
+    except Exception as e:
+        logging.exception("Unexpected error in /serverstatus")
+        await interaction.followup.send(f"❌ Error: {str(e)}")
+        return
+
+    issues = data.get("incidents", []) + data.get("maintenances", [])
+    if not issues:
+        embed = discord.Embed(
+            title=f"{region.upper()} Server Status",
+            description="✅ All systems operational.",
+            color=0x2ECC71
+        )
+    else:
+        lines = []
+        for issue in issues:
+            titles = issue.get("titles", [])
+            title = next((t["content"] for t in titles if t.get("locale") == "en_US"), titles[0]["content"] if titles else "Unknown issue")
+            lines.append(f"⚠️ {title} ({issue.get('severity', 'info')})")
+        embed = discord.Embed(
+            title=f"{region.upper()} Server Status",
+            description="\n".join(lines)[:4096],
+            color=0xE74C3C
+        )
+
+    await interaction.followup.send(embed=embed)
+
+@tree.command(name="champion", description="Show quick info about a champion")
+@app_commands.describe(name="Champion name (e.g. 'Wukong', 'Miss Fortune')")
+async def champion_info(interaction: discord.Interaction, name: str):
+    await interaction.response.defer(thinking=True)
+
+    match = await find_champion_by_name(name)
+    if not match:
+        await interaction.followup.send(f"❌ Couldn't find a champion matching '{name}'.")
+        return
+
+    alias, entry = match
+    roles = ", ".join(r.title() for r in entry.get("roles", [])) or "—"
+    embed = discord.Embed(
+        title=entry["name"],
+        description=f"**Common Roles:** {roles}",
+        color=0x9B59B6
+    )
+    embed.set_thumbnail(url=get_champion_icon_url_by_id(entry["id"]))
+    await interaction.followup.send(embed=embed)
 
 # ==================== REGISTRATION ====================
 @tree.command(name="register", description="Link your Discord account to a Riot ID for the leaderboard")
