@@ -143,6 +143,19 @@ def rank_sort_key(entry):
     division_index = DIVISION_ORDER.get(entry["division"], 0)
     return (tier_index, division_index, entry["lp"])
 
+async def fetch_profile_icon_id(puuid: str, region: str) -> int | None:
+    """Fetch just the summoner's profile icon ID. Returns None (never
+    raises) on failure — this is decorative, never something to block on."""
+    headers = {"X-Riot-Token": RIOT_API_KEY}
+    try:
+        summoner_url = f"https://{region}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/{puuid}"
+        resp = requests.get(summoner_url, headers=headers)
+        if resp.ok:
+            return resp.json().get("profileIconId")
+    except Exception:
+        logging.warning("Could not fetch profile icon", exc_info=True)
+    return None
+
 async def fetch_ranked_solo(name: str, region: str, fetch_icon: bool = False) -> dict:
     """Look up a Riot ID's Ranked Solo/Duo entry.
     Raises LPLookupError with a user-facing message on expected failures.
@@ -174,15 +187,7 @@ async def fetch_ranked_solo(name: str, region: str, fetch_icon: bool = False) ->
 
     # Optional: profile icon ID (Summoner-V4 still returns this field, even
     # though it no longer returns the encrypted "id" summoner ID).
-    profile_icon_id = None
-    if fetch_icon:
-        try:
-            summoner_url = f"https://{region}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/{puuid}"
-            summoner_resp = requests.get(summoner_url, headers=headers)
-            if summoner_resp.ok:
-                profile_icon_id = summoner_resp.json().get("profileIconId")
-        except Exception:
-            logging.warning("Could not fetch profile icon", exc_info=True)
+    profile_icon_id = await fetch_profile_icon_id(puuid, region) if fetch_icon else None
 
     # 2. PUUID -> Ranked entries (League-V4, platform routing)
     ranked_url = f"https://{region}.api.riotgames.com/lol/league/v4/entries/by-puuid/{puuid}"
@@ -214,12 +219,12 @@ async def fetch_ranked_solo(name: str, region: str, fetch_icon: bool = False) ->
         "puuid": puuid,
     }
 
-# ==================== CHAMPION NAMES ====================
-_CHAMPION_NAME_CACHE = {}
+# ==================== CHAMPION NAMES & ICONS ====================
+_CHAMPION_DATA_CACHE = {}
 
-def _load_champion_names_sync():
-    """Fetch and cache championName (API key, e.g. 'MonkeyKing') -> display name (e.g. 'Wukong')."""
-    if _CHAMPION_NAME_CACHE:
+def _load_champion_data_sync():
+    """Fetch and cache championName (API key, e.g. 'MonkeyKing') -> {name, id}."""
+    if _CHAMPION_DATA_CACHE:
         return
     try:
         resp = requests.get(
@@ -231,14 +236,26 @@ def _load_champion_names_sync():
         for champ in resp.json():
             alias = champ.get("alias")
             name = champ.get("name")
+            champ_id = champ.get("id")
             if alias and name:
-                _CHAMPION_NAME_CACHE[alias] = name
+                _CHAMPION_DATA_CACHE[alias] = {"name": name, "id": champ_id}
     except Exception:
-        logging.warning("Could not load champion name list", exc_info=True)
+        logging.warning("Could not load champion data list", exc_info=True)
 
 async def get_champion_display_name(champion_key: str) -> str:
-    await asyncio.to_thread(_load_champion_names_sync)
-    return _CHAMPION_NAME_CACHE.get(champion_key, champion_key)
+    await asyncio.to_thread(_load_champion_data_sync)
+    entry = _CHAMPION_DATA_CACHE.get(champion_key)
+    return entry["name"] if entry else champion_key
+
+async def get_champion_icon_url(champion_key: str) -> str | None:
+    await asyncio.to_thread(_load_champion_data_sync)
+    entry = _CHAMPION_DATA_CACHE.get(champion_key)
+    if not entry or entry.get("id") is None:
+        return None
+    return (
+        "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/"
+        f"global/default/v1/champion-icons/{entry['id']}.png"
+    )
 
 # ==================== MATCH HISTORY (Match-V5) ====================
 async def fetch_last_ranked_match(puuid: str, region: str) -> dict | None:
@@ -273,6 +290,7 @@ async def fetch_last_ranked_match(puuid: str, region: str) -> dict | None:
 
         return {
             "match_id": match_id,
+            "champion_key": participant["championName"],
             "champion": await get_champion_display_name(participant["championName"]),
             "kills": participant["kills"],
             "deaths": participant["deaths"],
@@ -359,21 +377,6 @@ async def fetch_recent_champion_stats(puuid: str, region: str) -> dict | None:
     except Exception:
         logging.warning(f"Could not fetch champion stats for puuid {puuid}", exc_info=True)
         return None
-
-def get_rank_emoji(rank):
-    emoji_dict = {
-        "IRON": "🛡️ Iron",
-        "BRONZE": "🥉 Bronze",
-        "SILVER": "🥈 Silver",
-        "GOLD": "🥇 Gold",
-        "PLATINUM": "💎 Platinum",
-        "EMERALD": "🌟 Emerald",
-        "DIAMOND": "⭐ Diamond",
-        "MASTER": "👑 Master",
-        "GRANDMASTER": "👑 Grandmaster",
-        "CHALLENGER": "🔥 Challenger"
-    }
-    return emoji_dict.get(rank, "❓ Unranked")
 
 def get_rank_color(rank):
     color_dict = {
@@ -477,7 +480,7 @@ async def register(interaction: discord.Interaction, name: str, region: str = "n
 
     baseline = None
     try:
-        baseline = await fetch_ranked_solo(name, region)
+        baseline = await fetch_ranked_solo(name, region, fetch_icon=True)
     except LPLookupError as e:
         msg = str(e)
         # Allow registering unranked players — only block on a bad Riot ID/region.
@@ -509,7 +512,22 @@ async def register(interaction: discord.Interaction, name: str, region: str = "n
     players[guild_id][str(interaction.user.id)] = entry
     save_players(players)
 
-    await interaction.followup.send(f"✅ Registered **{name}** ({region.upper()}) for {interaction.user.mention}.")
+    embed = discord.Embed(
+        title="✅ Registered",
+        description=f"Linked to {interaction.user.mention} — you'll now show up on `/leaderboard`.",
+        color=get_rank_color(baseline["tier"]) if baseline else 0x2ECC71
+    )
+    embed.set_author(
+        name=f"{name} ({region.upper()})",
+        icon_url=get_profile_icon_url(baseline["profile_icon_id"]) if baseline and baseline.get("profile_icon_id") else None
+    )
+    if baseline:
+        division = "" if baseline["tier"] in APEX_TIERS else f" {baseline['division']}"
+        embed.add_field(name="Current Rank", value=f"{baseline['tier'].title()}{division} • {baseline['lp']} LP", inline=False)
+    else:
+        embed.add_field(name="Current Rank", value="Unranked", inline=False)
+
+    await interaction.followup.send(embed=embed)
 
 @tree.command(name="setchannel", description="Set the channel for automatic LP update announcements (admin only)")
 @app_commands.describe(channel="The channel where win/loss LP updates should be posted")
@@ -585,23 +603,34 @@ async def leaderboard(interaction: discord.Interaction):
 
     results.sort(key=lambda r: rank_sort_key(r[2]), reverse=True)
 
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     lines = []
     for i, (user_id, name, data) in enumerate(results, start=1):
         member = interaction.guild.get_member(int(user_id))
         display = member.mention if member else name
         division = "" if data["tier"] in APEX_TIERS else f" {data['division']}"
-        lines.append(f"**{i}.** {display} — {get_rank_emoji(data['tier'])}{division} • {data['lp']} LP")
+        rank_label = medals.get(i, f"`{i}.`")
+        lines.append(f"{rank_label} {display} — {data['tier'].title()}{division} • {data['lp']} LP")
+
+    footer_text = f"{len(results)} player{'s' if len(results) != 1 else ''} ranked"
+    if failures:
+        footer_text += f" • Couldn't fetch: {', '.join(failures)}"
 
     embed = discord.Embed(
         title=f"🏆 {interaction.guild.name} Ranked Leaderboard",
         description="\n".join(lines)[:4096],
-        color=0xFFD700
+        color=get_rank_color(results[0][2]["tier"])
     )
-    embed.set_thumbnail(url=get_rank_emblem_url(results[0][2]["tier"]))
-    if failures:
-        embed.set_footer(text=f"Could not fetch: {', '.join(failures)}"[:2048])
+    embed.set_footer(text=footer_text[:2048])
 
-    await interaction.followup.send(embed=embed)
+    try:
+        emblem_file, emblem_filename = await get_cropped_emblem_file(results[0][2]["tier"])
+        embed.set_thumbnail(url=f"attachment://{emblem_filename}")
+        await interaction.followup.send(embed=embed, file=emblem_file)
+    except Exception:
+        logging.exception("Could not crop leaderboard emblem, falling back to raw URL")
+        embed.set_thumbnail(url=get_rank_emblem_url(results[0][2]["tier"]))
+        await interaction.followup.send(embed=embed)
 
 # ==================== AUTOMATIC UPDATES ====================
 async def do_poll_updates():
@@ -639,7 +668,8 @@ async def do_poll_updates():
                 loss_diff = data["losses"] - prev_losses
 
                 if win_diff > 0 or loss_diff > 0:
-                    result = "🟢 Won" if win_diff > 0 else "🔴 Lost"
+                    won = win_diff > 0
+                    title = "🟢 Victory" if won else "🔴 Defeat"
 
                     # Only show an LP delta if tier/division didn't change —
                     # otherwise the raw LP numbers aren't comparable (e.g. a
@@ -654,13 +684,12 @@ async def do_poll_updates():
                         lp_note = f" ({'+' if lp_diff >= 0 else ''}{lp_diff} LP)"
 
                     division = "" if data["tier"] in APEX_TIERS else f" {data['division']}"
-                    lines = [
-                        f"**{info['name']}** {result} a ranked game — now "
-                        f"{data['tier'].title()}{division} • {data['lp']} LP{lp_note}"
-                    ]
+                    lines = [f"{data['tier'].title()}{division} • {data['lp']} LP{lp_note}"]
 
+                    champion_icon_url = None
                     match_details = await fetch_last_ranked_match(data["puuid"], info["region"])
                     if match_details:
+                        champion_icon_url = await get_champion_icon_url(match_details["champion_key"])
                         mins, secs = divmod(match_details["duration_seconds"], 60)
                         lines.append(
                             f"{match_details['champion']} • "
@@ -669,9 +698,18 @@ async def do_poll_updates():
                         )
 
                     embed = discord.Embed(
+                        title=title,
                         description="\n".join(lines),
                         color=get_rank_color(data["tier"])
                     )
+                    profile_icon_id = await fetch_profile_icon_id(data["puuid"], info["region"])
+                    embed.set_author(
+                        name=f"{info['name']} ({info['region'].upper()})",
+                        icon_url=get_profile_icon_url(profile_icon_id) if profile_icon_id else None
+                    )
+                    if champion_icon_url:
+                        embed.set_thumbnail(url=champion_icon_url)
+
                     try:
                         await channel.send(embed=embed)
                     except discord.Forbidden:
