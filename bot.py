@@ -720,9 +720,13 @@ async def freerotation(interaction: discord.Interaction, region: str = "na1"):
         await interaction.followup.send(f"❌ Error: {str(e)}")
         return
 
-    champ_ids = data.get("freeChampionIds", [])
+    # Riot changed this response's field names at some point without
+    # updating public docs — it used to be "freeChampionIds", now it's the
+    # shorter "sr" (Summoner's Rift). Falling back to the old name too in
+    # case this reverts or varies by region/key.
+    champ_ids = data.get("sr") or data.get("freeChampionIds") or []
     if not champ_ids:
-        logging.warning(f"/freerotation got no freeChampionIds — raw response: {data}")
+        logging.warning(f"/freerotation got no free champion list — raw response: {data}")
     names = []
     for cid in champ_ids:
         champ = await get_champion_by_id(cid)
