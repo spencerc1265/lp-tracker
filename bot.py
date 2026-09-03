@@ -452,6 +452,16 @@ def get_rank_color(rank):
 @bot.event
 async def on_ready():
     logging.info(f"✅ BOT ONLINE! Logged in as {bot.user}")
+
+    # One-time cleanup: an earlier version of this bot used a global
+    # tree.sync() before switching to guild-specific sync below. Global
+    # command registrations persist on Discord's side independently of
+    # this code, so without this they'd keep showing up duplicated
+    # alongside the guild-scoped commands. Safe to leave this in
+    # permanently since we're guild-scoped going forward.
+    tree.clear_commands(guild=None)
+    await tree.sync(guild=None)
+
     tree.copy_global_to(guild=TEST_GUILD)
     synced = await tree.sync(guild=TEST_GUILD)
     logging.info(f"Slash commands synced to test guild ({len(synced)} commands)!")
