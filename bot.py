@@ -1,5 +1,6 @@
 import discord
 import requests
+import re
 import os
 import json
 import asyncio
@@ -26,6 +27,11 @@ TEST_GUILD = discord.Object(id=TEST_GUILD_ID)
 # Each check costs 2 Riot API calls per player, so raise this if you have
 # a lot of registered players and start hitting rate limits (429s).
 POLL_INTERVAL_MINUTES = int(os.getenv("LP_POLL_INTERVAL_MINUTES", "5"))
+
+# How often (minutes) to check for a new patch notes article. Patches drop
+# roughly biweekly, so this doesn't need to be frequent — kept longer than
+# the LP poll interval to be a good citizen toward the community news feed.
+PATCH_POLL_INTERVAL_MINUTES = int(os.getenv("PATCH_POLL_INTERVAL_MINUTES", "30"))
 
 # Where players.json / config.json live. Point this at a mounted volume's
 # path on hosting platforms with ephemeral filesystems (e.g. Railway),
@@ -452,6 +458,9 @@ async def on_ready():
     if not poll_for_updates.is_running():
         poll_for_updates.start()
         logging.info(f"Started auto-update polling loop (every {POLL_INTERVAL_MINUTES} min).")
+    if not poll_for_patch_notes.is_running():
+        poll_for_patch_notes.start()
+        logging.info(f"Started patch notes polling loop (every {PATCH_POLL_INTERVAL_MINUTES} min).")
 
 # ==================== COMMANDS ====================
 @tree.command(name="lp", description="Check your or someone's League LP / rank")
@@ -767,6 +776,76 @@ async def champion_info(interaction: discord.Interaction, name: str):
     embed.set_thumbnail(url=get_champion_icon_url_by_id(entry["id"]))
     await interaction.followup.send(embed=embed)
 
+# ==================== NEWS / PATCH NOTES ====================
+# Riot doesn't publish an official patch-notes API. This uses a community
+# service (rito-news-feeds / data.rito.news) that mirrors Riot's own
+# official news page into a standard JSONFeed. It's unofficial and
+# third-party — not Riot-supported — so it could change format or go
+# down without warning, unlike the calls above. Costs 0 Riot API calls.
+NEWS_FEED_URL = "https://data.rito.news/lol/en-us/news.jsonfeed"
+
+def _fetch_news_items_sync(limit: int = 20) -> list:
+    resp = requests.get(NEWS_FEED_URL, timeout=10)
+    resp.raise_for_status()
+    return resp.json().get("items", [])[:limit]
+
+@tree.command(name="news", description="Show the latest League of Legends news")
+async def news_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    try:
+        items = await asyncio.to_thread(_fetch_news_items_sync, 5)
+    except Exception:
+        logging.exception("Unexpected error in /news")
+        await interaction.followup.send("❌ Couldn't reach the news feed right now. Try again shortly.")
+        return
+
+    if not items:
+        await interaction.followup.send("❌ No news articles found right now.")
+        return
+
+    lines = []
+    for item in items:
+        title = item.get("title", "Untitled")
+        url = item.get("url", "")
+        date = (item.get("date_published") or "")[:10]
+        lines.append(f"**[{title}]({url})**" + (f" — {date}" if date else ""))
+
+    embed = discord.Embed(
+        title="📰 Latest League of Legends News",
+        description="\n\n".join(lines)[:4096],
+        color=0x1E90FF
+    )
+    embed.set_footer(text="Source: leagueoflegends.com (via unofficial community feed)")
+    await interaction.followup.send(embed=embed)
+
+@tree.command(name="patchnotes", description="Show the latest League of Legends patch notes")
+async def patchnotes(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    try:
+        items = await asyncio.to_thread(_fetch_news_items_sync, 20)
+    except Exception:
+        logging.exception("Unexpected error in /patchnotes")
+        await interaction.followup.send("❌ Couldn't reach the patch notes feed right now. Try again shortly.")
+        return
+
+    patch_item = next((item for item in items if re.match(r"^patch", item.get("title", ""), re.IGNORECASE)), None)
+    if not patch_item:
+        await interaction.followup.send("❌ Couldn't find a recent patch notes article.")
+        return
+
+    embed = discord.Embed(
+        title=patch_item.get("title", "Patch Notes"),
+        url=patch_item.get("url"),
+        description=(patch_item.get("summary") or "")[:500],
+        color=0x1E90FF
+    )
+    image = patch_item.get("image") or patch_item.get("banner_image")
+    if image:
+        embed.set_image(url=image)
+    date = (patch_item.get("date_published") or "")[:10]
+    embed.set_footer(text=f"Published {date}" if date else "Source: leagueoflegends.com (via unofficial community feed)")
+    await interaction.followup.send(embed=embed)
+
 # ==================== REGISTRATION ====================
 @tree.command(name="register", description="Link your Discord account to a Riot ID for the leaderboard")
 @app_commands.describe(
@@ -837,7 +916,8 @@ async def register(interaction: discord.Interaction, name: str, region: str = "n
 async def setchannel(interaction: discord.Interaction, channel: discord.TextChannel):
     guild_id = str(interaction.guild_id)
     config = load_config()
-    config[guild_id] = {"update_channel_id": channel.id}
+    config.setdefault(guild_id, {})
+    config[guild_id]["update_channel_id"] = channel.id
     save_config(config)
     await interaction.response.send_message(
         f"✅ LP update announcements will now be posted in {channel.mention} "
@@ -853,6 +933,32 @@ async def setchannel_error(interaction: discord.Interaction, error: app_commands
         )
     else:
         logging.exception("Error in /setchannel")
+        await interaction.response.send_message("❌ Something went wrong.", ephemeral=True)
+
+@tree.command(name="setpatchchannel", description="Set the channel for automatic patch notes announcements (admin only)")
+@app_commands.describe(channel="The channel where new patch notes should be posted")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setpatchchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    guild_id = str(interaction.guild_id)
+    config = load_config()
+    config.setdefault(guild_id, {})
+    config[guild_id]["patch_channel_id"] = channel.id
+    save_config(config)
+    await interaction.response.send_message(
+        f"✅ New patch notes will now be posted in {channel.mention} "
+        f"(checked every {PATCH_POLL_INTERVAL_MINUTES} min). "
+        f"Only patches published *after* this is set will be announced.",
+        ephemeral=True
+    )
+
+@setpatchchannel.error
+async def setpatchchannel_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ You need the 'Manage Server' permission to set the patch notes channel.", ephemeral=True
+        )
+    else:
+        logging.exception("Error in /setpatchchannel")
         await interaction.response.send_message("❌ Something went wrong.", ephemeral=True)
 
 @tree.command(name="unregister", description="Remove yourself from this server's leaderboard")
@@ -1035,6 +1141,87 @@ async def poll_for_updates():
 @poll_for_updates.before_loop
 async def before_poll_for_updates():
     await bot.wait_until_ready()
+
+# ==================== PATCH NOTES POLLING ====================
+async def do_poll_patch_notes():
+    """Check the news feed for a new patch notes article and announce it
+    to every guild that's configured a patch channel. State is tracked
+    globally (under config["_meta"]) since the patch content is the same
+    for everyone — one feed check covers all servers."""
+    config = load_config()
+
+    try:
+        items = await asyncio.to_thread(_fetch_news_items_sync, 20)
+    except Exception:
+        logging.exception("Could not fetch news feed during patch poll")
+        return
+
+    patch_item = next((item for item in items if re.match(r"^patch", item.get("title", ""), re.IGNORECASE)), None)
+    if not patch_item:
+        return
+
+    patch_url = patch_item.get("url")
+    meta = config.get("_meta", {})
+    if meta.get("last_patch_url") == patch_url:
+        return  # already announced (or this is still the known-latest patch)
+
+    is_first_check = "last_patch_url" not in meta
+    config["_meta"] = {"last_patch_url": patch_url, "last_patch_title": patch_item.get("title")}
+    save_config(config)
+
+    if is_first_check:
+        # Don't blast the currently-latest patch to every newly-configured
+        # channel — just record it as the baseline, same as LP registration.
+        return
+
+    embed = discord.Embed(
+        title=patch_item.get("title", "Patch Notes"),
+        url=patch_url,
+        description=(patch_item.get("summary") or "")[:500],
+        color=0x1E90FF
+    )
+    image = patch_item.get("image") or patch_item.get("banner_image")
+    if image:
+        embed.set_image(url=image)
+    date = (patch_item.get("date_published") or "")[:10]
+    embed.set_footer(text=f"Published {date}" if date else "Source: leagueoflegends.com (via unofficial community feed)")
+
+    for guild_id, guild_cfg in config.items():
+        if guild_id == "_meta":
+            continue
+        channel_id = guild_cfg.get("patch_channel_id")
+        if not channel_id:
+            continue
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            continue
+        try:
+            await channel.send(embed=embed)
+        except discord.Forbidden:
+            logging.warning(f"No permission to post patch notes in channel {channel_id}")
+
+@tasks.loop(minutes=PATCH_POLL_INTERVAL_MINUTES)
+async def poll_for_patch_notes():
+    await do_poll_patch_notes()
+
+@poll_for_patch_notes.before_loop
+async def before_poll_for_patch_notes():
+    await bot.wait_until_ready()
+
+@tree.command(name="forcepatchcheck", description="Manually trigger a patch notes check right now (admin only)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def forcepatchcheck(interaction: discord.Interaction):
+    await interaction.response.send_message("🔄 Checking for new patch notes now...", ephemeral=True)
+    await do_poll_patch_notes()
+
+@forcepatchcheck.error
+async def forcepatchcheck_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ You need the 'Manage Server' permission to force a patch check.", ephemeral=True
+        )
+    else:
+        logging.exception("Error in /forcepatchcheck")
 
 @tree.command(name="forceupdate", description="Manually trigger an LP update check right now (admin only)")
 @app_commands.checks.has_permissions(manage_guild=True)
