@@ -721,6 +721,8 @@ async def freerotation(interaction: discord.Interaction, region: str = "na1"):
         return
 
     champ_ids = data.get("freeChampionIds", [])
+    if not champ_ids:
+        logging.warning(f"/freerotation got no freeChampionIds — raw response: {data}")
     names = []
     for cid in champ_ids:
         champ = await get_champion_by_id(cid)
