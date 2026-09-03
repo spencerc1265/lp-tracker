@@ -465,15 +465,29 @@ async def on_ready():
 # ==================== COMMANDS ====================
 @tree.command(name="lp", description="Check your or someone's League LP / rank")
 @app_commands.describe(
-    name="Riot ID in the form GameName#Tag (e.g. 'Player#1234')",
-    region="Platform region (default na1): na1, euw1, eun1, kr, jp1, br1, la1, la2, oc1, tr1, ru"
+    name="Riot ID in the form GameName#Tag — leave blank to use your (or member's) registered account",
+    member="A registered Discord member to check instead of yourself (ignored if 'name' is given)",
+    region="Platform region — leave blank to use the registered region, or a default of na1"
 )
-async def lp(interaction: discord.Interaction, name: str, region: str = "na1"):
+async def lp(interaction: discord.Interaction, name: str = None, member: discord.Member = None, region: str = None):
     await interaction.response.defer(thinking=True)
 
     if not RIOT_API_KEY:
         await interaction.followup.send("❌ No RIOT_API_KEY found!")
         return
+
+    if name is None:
+        target = member or interaction.user
+        guild_id = str(interaction.guild_id)
+        entry = load_players().get(guild_id, {}).get(str(target.id))
+        if not entry:
+            who = "You aren't" if target.id == interaction.user.id else f"{target.mention} isn't"
+            await interaction.followup.send(f"❌ {who} registered. Use `/register` first, or provide a Riot ID directly.")
+            return
+        name = entry["name"]
+        region = region or entry["region"]
+    else:
+        region = region or "na1"
 
     try:
         data = await fetch_ranked_solo(name, region, fetch_icon=True)
