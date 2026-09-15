@@ -862,7 +862,7 @@ async def patchnotes(interaction: discord.Interaction):
         await interaction.followup.send("❌ Couldn't reach the patch notes feed right now. Try again shortly.")
         return
 
-    patch_item = next((item for item in items if re.match(r"^patch", item.get("title", ""), re.IGNORECASE)), None)
+    patch_item = next((item for item in items if re.search(r"patch\s+[\d.]+.*notes", item.get("title", ""), re.IGNORECASE)), None)
     if not patch_item:
         await interaction.followup.send("❌ Couldn't find a recent patch notes article.")
         return
@@ -1190,7 +1190,7 @@ async def do_poll_patch_notes():
         logging.exception("Could not fetch news feed during patch poll")
         return
 
-    patch_item = next((item for item in items if re.match(r"^patch", item.get("title", ""), re.IGNORECASE)), None)
+    patch_item = next((item for item in items if re.search(r"patch\s+[\d.]+.*notes", item.get("title", ""), re.IGNORECASE)), None)
     if not patch_item:
         logging.info(f"Patch poll: no article titled 'Patch...' found among {len(items)} news items.")
         return
