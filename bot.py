@@ -1192,11 +1192,15 @@ async def do_poll_patch_notes():
 
     patch_item = next((item for item in items if re.match(r"^patch", item.get("title", ""), re.IGNORECASE)), None)
     if not patch_item:
+        logging.info(f"Patch poll: no article titled 'Patch...' found among {len(items)} news items.")
         return
 
     patch_url = patch_item.get("url")
     meta = config.get("_meta", {})
+    logging.info(f"Patch poll: latest article is '{patch_item.get('title')}' ({patch_url}). Last announced: {meta.get('last_patch_url')}")
+
     if meta.get("last_patch_url") == patch_url:
+        logging.info("Patch poll: no change since last check.")
         return  # already announced (or this is still the known-latest patch)
 
     is_first_check = "last_patch_url" not in meta
@@ -1206,7 +1210,15 @@ async def do_poll_patch_notes():
     if is_first_check:
         # Don't blast the currently-latest patch to every newly-configured
         # channel — just record it as the baseline, same as LP registration.
+        logging.info("Patch poll: first check ever, recorded baseline, not announcing.")
         return
+
+    patch_channels = [
+        (guild_id, guild_cfg.get("patch_channel_id"))
+        for guild_id, guild_cfg in config.items()
+        if guild_id != "_meta" and guild_cfg.get("patch_channel_id")
+    ]
+    logging.info(f"Patch poll: NEW patch detected, announcing to {len(patch_channels)} configured channel(s).")
 
     embed = discord.Embed(
         title=patch_item.get("title", "Patch Notes"),
@@ -1228,6 +1240,7 @@ async def do_poll_patch_notes():
             continue
         channel = bot.get_channel(channel_id)
         if channel is None:
+            logging.warning(f"Patch poll: bot.get_channel({channel_id}) returned None — bot may not have access to this channel.")
             continue
         try:
             await channel.send(embed=embed)
@@ -1255,7 +1268,11 @@ async def forcepatchcheck_error(interaction: discord.Interaction, error: app_com
             "❌ You need the 'Manage Server' permission to force a patch check.", ephemeral=True
         )
     else:
-        logging.exception("Error in /forcepatchcheck")
+        logging.error(f"Error in /forcepatchcheck: {error}", exc_info=error)
+        try:
+            await interaction.followup.send("❌ Something went wrong — check the bot logs for details.", ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 @tree.command(name="forceupdate", description="Manually trigger an LP update check right now (admin only)")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -1270,7 +1287,11 @@ async def forceupdate_error(interaction: discord.Interaction, error: app_command
             "❌ You need the 'Manage Server' permission to force an update check.", ephemeral=True
         )
     else:
-        logging.exception("Error in /forceupdate")
+        logging.error(f"Error in /forceupdate: {error}", exc_info=error)
+        try:
+            await interaction.followup.send("❌ Something went wrong — check the bot logs for details.", ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 # ==================== START ====================
 if __name__ == "__main__":
