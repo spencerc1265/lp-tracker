@@ -1199,16 +1199,16 @@ def _fetch_news_items_sync(limit: int = 20) -> list:
     return resp.json().get("items", [])[:limit]
 
 def get_patch_highlight_image(item: dict) -> str | None:
-    """Prefer the article's first inline image (usually the 'patch
-    highlights' nerfs/buffs/new-skins summary graphic Riot posts at the top
-    of the article body) over the feed's own image/banner_image field,
-    which points at something else (often unrelated splash art) instead.
-    This is an inference, not a confirmed field — logs a warning so any
-    mismatch is easy to spot and fix."""
+    """Attempt to find the article's 'patch highlights' nerfs/buffs/new-skins
+    summary graphic among its inline content images. The first inline image
+    turned out to be the wrong one (article splash art, not the highlights
+    graphic) — logging every candidate URL here so the right one can be
+    identified with certainty instead of guessed at again."""
     html = item.get("content_html") or ""
-    match = re.search(r'<img[^>]+src="([^"]+)"', html, re.IGNORECASE)
-    if match:
-        return match.group(1)
+    matches = re.findall(r'<img[^>]+src="([^"]+)"', html, re.IGNORECASE)
+    logging.info(f"Patch image candidates for '{item.get('title')}': {matches}")
+    if matches:
+        return matches[0]
     logging.warning(f"No inline image found in content_html for '{item.get('title')}' — falling back to feed image field.")
     return item.get("image") or item.get("banner_image")
 
@@ -1262,7 +1262,7 @@ async def patchnotes(interaction: discord.Interaction):
         description=(patch_item.get("summary") or "")[:500],
         color=0x1E90FF
     )
-    image = patch_item.get("image") or patch_item.get("banner_image")
+    image = get_patch_highlight_image(patch_item)
     if image:
         embed.set_image(url=image)
     date = (patch_item.get("date_published") or "")[:10]
@@ -1865,7 +1865,7 @@ async def do_poll_patch_notes():
         description=(patch_item.get("summary") or "")[:500],
         color=0x1E90FF
     )
-    image = patch_item.get("image") or patch_item.get("banner_image")
+    image = get_patch_highlight_image(patch_item)
     if image:
         embed.set_image(url=image)
     date = (patch_item.get("date_published") or "")[:10]
