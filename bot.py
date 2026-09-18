@@ -1407,7 +1407,12 @@ CAPABILITIES_CATEGORIES = {
 }
 
 async def build_capabilities_embed() -> discord.Embed:
-    all_commands = {cmd.name: cmd for cmd in tree.get_commands()}
+    # Read from the guild-scoped command list, not the global one — the
+    # global list gets intentionally emptied in on_ready (see the comment
+    # there about clearing stale Discord-side global command registrations),
+    # so it's empty by the time this runs. The guild-scoped copy isn't
+    # affected by that and reflects what's actually live in the server.
+    all_commands = {cmd.name: cmd for cmd in tree.get_commands(guild=TEST_GUILD)}
 
     embed = discord.Embed(
         title="🤖 LP Tracker — Current Capabilities",
