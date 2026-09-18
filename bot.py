@@ -1198,6 +1198,20 @@ def _fetch_news_items_sync(limit: int = 20) -> list:
     resp.raise_for_status()
     return resp.json().get("items", [])[:limit]
 
+def get_patch_highlight_image(item: dict) -> str | None:
+    """Prefer the article's first inline image (usually the 'patch
+    highlights' nerfs/buffs/new-skins summary graphic Riot posts at the top
+    of the article body) over the feed's own image/banner_image field,
+    which points at something else (often unrelated splash art) instead.
+    This is an inference, not a confirmed field — logs a warning so any
+    mismatch is easy to spot and fix."""
+    html = item.get("content_html") or ""
+    match = re.search(r'<img[^>]+src="([^"]+)"', html, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    logging.warning(f"No inline image found in content_html for '{item.get('title')}' — falling back to feed image field.")
+    return item.get("image") or item.get("banner_image")
+
 @tree.command(name="news", description="Show the latest League of Legends news")
 async def news_cmd(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
