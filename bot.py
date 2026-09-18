@@ -1198,27 +1198,42 @@ def _fetch_news_items_sync(limit: int = 20) -> list:
     resp.raise_for_status()
     return resp.json().get("items", [])[:limit]
 
-def get_patch_intro_blurb(item: dict, max_chars: int = 400) -> str:
-    """Pull the article's actual opening paragraph from its body text,
-    rather than the feed's 'summary' field (usually just a generic
-    one-line SEO description). Prefers content_text; falls back to
-    stripping tags from content_html if that's empty. Plain text, so
-    unlike the highlights graphic, this doesn't depend on JS rendering —
-    it's genuinely present in the feed's static data."""
-    text = (item.get("content_text") or "").strip()
-    if not text:
-        html = item.get("content_html") or ""
-        text = re.sub(r"<[^>]+>", " ", html)
+def _fetch_patch_intro_blurb_sync(article_url: str, max_chars: int = 400) -> str | None:
+    """Fetch Riot's actual article page directly (the feed itself carries
+    no body text — confirmed empty on every item) and pull the intro
+    blockquote out of its static HTML. Unlike the highlights graphic, this
+    text is genuinely server-rendered, not JS-injected — confirmed by
+    seeing it directly in a plain page fetch. Returns None (never raises)
+    if the page can't be fetched or the expected markup isn't found."""
+    try:
+        resp = requests.get(article_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        match = re.search(r"<blockquote[^>]*>(.*?)</blockquote>", resp.text, re.IGNORECASE | re.DOTALL)
+        if not match:
+            logging.info(f"No <blockquote> found in article HTML for {article_url}")
+            return None
+        text = re.sub(r"<[^>]+>", " ", match.group(1))
         text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return None
+        if len(text) > max_chars:
+            text = text[:max_chars].rsplit(" ", 1)[0] + "…"
+        return text
+    except Exception:
+        logging.warning(f"Could not fetch/parse article page for intro blurb: {article_url}", exc_info=True)
+        return None
 
-    if not text:
-        return item.get("summary") or ""
-
-    first_para = re.split(r"\n\s*\n", text)[0].strip() or text
-    if len(first_para) > max_chars:
-        first_para = first_para[:max_chars].rsplit(" ", 1)[0] + "…"
-
-    return first_para or (item.get("summary") or "")
+async def get_patch_intro_blurb(item: dict, max_chars: int = 400) -> str:
+    """Get a real intro blurb for the patch article. The feed's own
+    content_text/content_html are empty for every item (confirmed via
+    logs), so this fetches Riot's actual page directly instead. Falls
+    back to the feed's short one-line 'summary' if that fetch/parse fails."""
+    url = item.get("url")
+    if url:
+        blurb = await asyncio.to_thread(_fetch_patch_intro_blurb_sync, url, max_chars)
+        if blurb:
+            return blurb
+    return item.get("summary") or ""
 
 def get_patch_highlight_image(item: dict) -> str | None:
     """Attempt to find the article's 'patch highlights' nerfs/buffs/new-skins
@@ -1278,7 +1293,7 @@ async def patchnotes(interaction: discord.Interaction):
         await interaction.followup.send("❌ Couldn't find a recent patch notes article.")
         return
 
-    blurb = get_patch_intro_blurb(patch_item)
+    blurb = await get_patch_intro_blurb(patch_item)
     logging.info(f"Patch blurb extracted ({len(blurb)} chars): {blurb[:120]!r}")
 
     embed = discord.Embed(
@@ -1884,7 +1899,7 @@ async def do_poll_patch_notes():
     ]
     logging.info(f"Patch poll: NEW patch detected, announcing to {len(patch_channels)} configured channel(s).")
 
-    blurb = get_patch_intro_blurb(patch_item)
+    blurb = await get_patch_intro_blurb(patch_item)
     logging.info(f"Patch blurb extracted ({len(blurb)} chars): {blurb[:120]!r}")
 
     embed = discord.Embed(
