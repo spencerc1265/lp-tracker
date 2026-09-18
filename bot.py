@@ -1403,7 +1403,6 @@ CAPABILITIES_CATEGORIES = {
     "🎮 League of Legends": ["lp", "register", "unregister", "leaderboard", "mastery", "livegame", "freerotation", "serverstatus", "champion"],
     "🧩 Teamfight Tactics": ["tftlp", "tftregister", "tftunregister", "tftleaderboard"],
     "📰 News": ["news", "patchnotes"],
-    "⚙️ Server Setup (admin only)": ["setchannel", "setpatchchannel", "settftchannel", "setcapabilities", "updatecapabilities", "forceupdate", "forcepatchcheck", "tftforceupdate"],
 }
 
 async def build_capabilities_embed() -> discord.Embed:
