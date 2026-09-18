@@ -1198,6 +1198,28 @@ def _fetch_news_items_sync(limit: int = 20) -> list:
     resp.raise_for_status()
     return resp.json().get("items", [])[:limit]
 
+def get_patch_intro_blurb(item: dict, max_chars: int = 400) -> str:
+    """Pull the article's actual opening paragraph from its body text,
+    rather than the feed's 'summary' field (usually just a generic
+    one-line SEO description). Prefers content_text; falls back to
+    stripping tags from content_html if that's empty. Plain text, so
+    unlike the highlights graphic, this doesn't depend on JS rendering —
+    it's genuinely present in the feed's static data."""
+    text = (item.get("content_text") or "").strip()
+    if not text:
+        html = item.get("content_html") or ""
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", text).strip()
+
+    if not text:
+        return item.get("summary") or ""
+
+    first_para = re.split(r"\n\s*\n", text)[0].strip() or text
+    if len(first_para) > max_chars:
+        first_para = first_para[:max_chars].rsplit(" ", 1)[0] + "…"
+
+    return first_para or (item.get("summary") or "")
+
 def get_patch_highlight_image(item: dict) -> str | None:
     """Attempt to find the article's 'patch highlights' nerfs/buffs/new-skins
     summary graphic among its inline content images. The first inline image
@@ -1256,10 +1278,13 @@ async def patchnotes(interaction: discord.Interaction):
         await interaction.followup.send("❌ Couldn't find a recent patch notes article.")
         return
 
+    blurb = get_patch_intro_blurb(patch_item)
+    logging.info(f"Patch blurb extracted ({len(blurb)} chars): {blurb[:120]!r}")
+
     embed = discord.Embed(
         title=patch_item.get("title", "Patch Notes"),
         url=patch_item.get("url"),
-        description=(patch_item.get("summary") or "")[:500],
+        description=blurb,
         color=0x1E90FF
     )
     image = get_patch_highlight_image(patch_item)
@@ -1859,10 +1884,13 @@ async def do_poll_patch_notes():
     ]
     logging.info(f"Patch poll: NEW patch detected, announcing to {len(patch_channels)} configured channel(s).")
 
+    blurb = get_patch_intro_blurb(patch_item)
+    logging.info(f"Patch blurb extracted ({len(blurb)} chars): {blurb[:120]!r}")
+
     embed = discord.Embed(
         title=patch_item.get("title", "Patch Notes"),
         url=patch_url,
-        description=(patch_item.get("summary") or "")[:500],
+        description=blurb,
         color=0x1E90FF
     )
     image = get_patch_highlight_image(patch_item)
