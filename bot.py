@@ -5,6 +5,7 @@ import os
 import json
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from PIL import Image
 from dotenv import load_dotenv
@@ -35,6 +36,13 @@ PATCH_POLL_INTERVAL_MINUTES = int(os.getenv("PATCH_POLL_INTERVAL_MINUTES", "30")
 
 # How often (minutes) to check registered TFT players for new ranked games.
 TFT_POLL_INTERVAL_MINUTES = int(os.getenv("TFT_POLL_INTERVAL_MINUTES", "5"))
+
+# How often (minutes) to check whether any guild's digest is due. The digest
+# itself fires roughly every N days from whenever it was last posted (not
+# at a fixed clock time) — simpler and more robust across restarts than
+# trying to align to exact midnight/calendar boundaries.
+DIGEST_CHECK_INTERVAL_MINUTES = int(os.getenv("DIGEST_CHECK_INTERVAL_MINUTES", "60"))
+DIGEST_FREQUENCY_DAYS = {"daily": 1, "weekly": 7}
 
 # Where players.json / config.json live. Point this at a mounted volume's
 # path on hosting platforms with ephemeral filesystems (e.g. Railway),
@@ -627,6 +635,9 @@ async def on_ready():
     if not poll_for_patch_notes.is_running():
         poll_for_patch_notes.start()
         logging.info(f"Started patch notes polling loop (every {PATCH_POLL_INTERVAL_MINUTES} min).")
+    if not check_digests.is_running():
+        check_digests.start()
+        logging.info(f"Started LP digest check loop (every {DIGEST_CHECK_INTERVAL_MINUTES} min).")
 
     await refresh_all_capabilities_messages()
 
@@ -1397,6 +1408,224 @@ async def setchannel_error(interaction: discord.Interaction, error: app_commands
     else:
         logging.exception("Error in /setchannel")
         await interaction.response.send_message("❌ Something went wrong.", ephemeral=True)
+
+# ==================== LP DIGEST ====================
+async def build_and_post_digest(guild_id: str, guild: discord.Guild, channel: discord.TextChannel):
+    """Fetch every registered player's current rank, diff it against their
+    stored baseline, post a summary, then reset the baseline for the next
+    period. Costs one fetch per registered player — same pattern as
+    /leaderboard, just run on a schedule instead of on demand."""
+    players = load_players()
+    guild_players = players.get(guild_id, {})
+    if not guild_players:
+        return
+
+    results = []
+    for user_id, info in guild_players.items():
+        try:
+            data = await fetch_ranked_solo(info["name"], info["region"])
+        except Exception:
+            logging.warning(f"Digest: could not fetch {info['name']}", exc_info=True)
+            await asyncio.sleep(0.3)
+            continue
+
+        start_wins = info.get("digest_start_wins")
+        start_losses = info.get("digest_start_losses")
+
+        if start_wins is not None:
+            games_won = data["wins"] - start_wins
+            games_lost = data["losses"] - start_losses
+            same_rank = (
+                info.get("digest_start_tier") == data["tier"]
+                and info.get("digest_start_division") == data["division"]
+            )
+            lp_change = (data["lp"] - info.get("digest_start_lp", data["lp"])) if same_rank else None
+            results.append({
+                "user_id": user_id, "name": info["name"], "data": data,
+                "games_won": games_won, "games_lost": games_lost,
+                "lp_change": lp_change, "rank_changed": not same_rank,
+            })
+
+        # Reset baseline for the next period regardless (covers both a
+        # reported player and one being baselined for the first time).
+        info["digest_start_tier"] = data["tier"]
+        info["digest_start_division"] = data["division"]
+        info["digest_start_lp"] = data["lp"]
+        info["digest_start_wins"] = data["wins"]
+        info["digest_start_losses"] = data["losses"]
+        await asyncio.sleep(0.3)
+
+    save_players(players)
+
+    active = [r for r in results if (r["games_won"] + r["games_lost"]) > 0]
+    if not active:
+        embed = discord.Embed(title="📊 LP Digest", description="No ranked games played this period.", color=0x95A5A6)
+        await channel.send(embed=embed)
+        return
+
+    active.sort(key=lambda r: (r["lp_change"] if r["lp_change"] is not None else 0), reverse=True)
+
+    lines = []
+    for r in active:
+        member = guild.get_member(int(r["user_id"]))
+        display = member.mention if member else r["name"]
+        division = "" if r["data"]["tier"] in APEX_TIERS else f" {r['data']['division']}"
+        rank_str = f"{r['data']['tier'].title()}{division} • {r['data']['lp']} LP"
+        if r["rank_changed"]:
+            change_str = "📈 rank changed"
+        elif r["lp_change"] is not None:
+            change_str = f"{'+' if r['lp_change'] >= 0 else ''}{r['lp_change']} LP"
+        else:
+            change_str = ""
+        lines.append(f"**{display}** — {r['games_won']}W {r['games_lost']}L ({change_str}) — now {rank_str}")
+
+    embed = discord.Embed(
+        title="📊 LP Digest",
+        description="\n".join(lines)[:4096],
+        color=0x5865F2
+    )
+    embed.set_footer(text=f"{len(active)} player(s) played this period")
+    await channel.send(embed=embed)
+
+async def do_check_digests():
+    config = load_config()
+    now = datetime.now(timezone.utc)
+
+    for guild_id, guild_cfg in list(config.items()):
+        if guild_id == "_meta":
+            continue
+        channel_id = guild_cfg.get("digest_channel_id")
+        frequency = guild_cfg.get("digest_frequency")
+        last_posted_str = guild_cfg.get("digest_last_posted")
+        if not channel_id or not frequency or not last_posted_str:
+            continue
+
+        try:
+            last_posted = datetime.fromisoformat(last_posted_str)
+        except ValueError:
+            continue
+
+        days = DIGEST_FREQUENCY_DAYS.get(frequency, 1)
+        if now - last_posted < timedelta(days=days):
+            continue
+
+        channel = bot.get_channel(channel_id)
+        guild = bot.get_guild(int(guild_id))
+        if channel is None or guild is None:
+            continue
+
+        try:
+            await build_and_post_digest(guild_id, guild, channel)
+        except Exception:
+            logging.exception(f"Error building digest for guild {guild_id}")
+            continue
+
+        config = load_config()
+        config.setdefault(guild_id, {})
+        config[guild_id]["digest_last_posted"] = now.isoformat()
+        save_config(config)
+
+@tasks.loop(minutes=DIGEST_CHECK_INTERVAL_MINUTES)
+async def check_digests():
+    await do_check_digests()
+
+@check_digests.before_loop
+async def before_check_digests():
+    await bot.wait_until_ready()
+
+@tree.command(name="setdigestchannel", description="Set the channel + frequency for automatic LP digest summaries (admin only)")
+@app_commands.describe(channel="Channel for the digest", frequency="How often to post it")
+@app_commands.choices(frequency=[
+    app_commands.Choice(name="Daily", value="daily"),
+    app_commands.Choice(name="Weekly", value="weekly"),
+])
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setdigestchannel(interaction: discord.Interaction, channel: discord.TextChannel, frequency: app_commands.Choice[str]):
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = str(interaction.guild_id)
+    config = load_config()
+    config.setdefault(guild_id, {})
+    config[guild_id]["digest_channel_id"] = channel.id
+    config[guild_id]["digest_frequency"] = frequency.value
+    config[guild_id]["digest_last_posted"] = datetime.now(timezone.utc).isoformat()
+    save_config(config)
+
+    # Snapshot a baseline for everyone currently registered, so the first
+    # digest measures from right now rather than from account creation.
+    players = load_players()
+    guild_players = players.get(guild_id, {})
+    updated = False
+    for user_id, info in guild_players.items():
+        try:
+            data = await fetch_ranked_solo(info["name"], info["region"])
+            info["digest_start_tier"] = data["tier"]
+            info["digest_start_division"] = data["division"]
+            info["digest_start_lp"] = data["lp"]
+            info["digest_start_wins"] = data["wins"]
+            info["digest_start_losses"] = data["losses"]
+            updated = True
+        except Exception:
+            logging.warning(f"Could not snapshot baseline for {info['name']} during digest setup", exc_info=True)
+        await asyncio.sleep(0.3)
+    if updated:
+        save_players(players)
+
+    days = DIGEST_FREQUENCY_DAYS[frequency.value]
+    await interaction.followup.send(
+        f"✅ A {frequency.value} LP digest will now be posted in {channel.mention} "
+        f"(roughly every {days} day{'s' if days != 1 else ''} from now — not pinned to a fixed clock time).",
+        ephemeral=True
+    )
+
+@setdigestchannel.error
+async def setdigestchannel_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ You need the 'Manage Server' permission to set the digest channel.", ephemeral=True
+        )
+    else:
+        logging.exception("Error in /setdigestchannel")
+        await interaction.response.send_message("❌ Something went wrong.", ephemeral=True)
+
+@tree.command(name="forcedigest", description="Manually post the LP digest right now (admin only)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def forcedigest(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = str(interaction.guild_id)
+    config = load_config()
+    channel_id = config.get(guild_id, {}).get("digest_channel_id")
+    if not channel_id:
+        await interaction.followup.send("❌ No digest channel set — use `/setdigestchannel` first.", ephemeral=True)
+        return
+
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        await interaction.followup.send("❌ Can't access the configured digest channel.", ephemeral=True)
+        return
+
+    await build_and_post_digest(guild_id, interaction.guild, channel)
+
+    config = load_config()
+    config.setdefault(guild_id, {})
+    config[guild_id]["digest_last_posted"] = datetime.now(timezone.utc).isoformat()
+    save_config(config)
+
+    await interaction.followup.send("✅ Digest posted.", ephemeral=True)
+
+@forcedigest.error
+async def forcedigest_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ You need the 'Manage Server' permission to force a digest.", ephemeral=True
+        )
+    else:
+        logging.error(f"Error in /forcedigest: {error}", exc_info=error)
+        try:
+            await interaction.followup.send("❌ Something went wrong — check the bot logs for details.", ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 @tree.command(name="setpatchchannel", description="Set the channel for automatic patch notes announcements (admin only)")
 @app_commands.describe(channel="The channel where new patch notes should be posted")
