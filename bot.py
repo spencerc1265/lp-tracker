@@ -6,6 +6,7 @@ import json
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
+from html import unescape
 from io import BytesIO
 from PIL import Image
 from dotenv import load_dotenv
@@ -43,6 +44,17 @@ TFT_POLL_INTERVAL_MINUTES = int(os.getenv("TFT_POLL_INTERVAL_MINUTES", "5"))
 # trying to align to exact midnight/calendar boundaries.
 DIGEST_CHECK_INTERVAL_MINUTES = int(os.getenv("DIGEST_CHECK_INTERVAL_MINUTES", "60"))
 DIGEST_FREQUENCY_DAYS = {"daily": 1, "weekly": 7}
+
+# How often (minutes) to re-sync automatic rank roles. Each sync costs 2 Riot
+# API calls per registered player in every server that has rank roles turned
+# on, so raise this if you have many registered players.
+ROLE_SYNC_INTERVAL_MINUTES = int(os.getenv("ROLE_SYNC_INTERVAL_MINUTES", "30"))
+RANK_ROLE_PREFIX = "LoL "
+
+# How long (seconds) the item list from Data Dragon is cached before being
+# re-fetched — items change with patches, but not often enough to need a
+# fetch per command.
+ITEM_CACHE_TTL_SECONDS = int(os.getenv("ITEM_CACHE_TTL_SECONDS", str(6 * 60 * 60)))
 
 # Where players.json / config.json live. Point this at a mounted volume's
 # path on hosting platforms with ephemeral filesystems (e.g. Railway),
@@ -170,6 +182,32 @@ def rank_sort_key(entry):
     tier_index = TIER_ORDER.index(entry["tier"]) if entry["tier"] in TIER_ORDER else -1
     division_index = DIVISION_ORDER.get(entry["division"], 0)
     return (tier_index, division_index, entry["lp"])
+
+def approx_total_lp(entry) -> int:
+    """Rough single-number ladder position (400 per tier, 100 per division)
+    so two ranks can be compared as an LP gap. Approximate on purpose: real
+    promotion costs vary, and Master+ is treated as one continuous LP scale."""
+    if entry["tier"] in APEX_TIERS:
+        base = TIER_ORDER.index("MASTER") * 400
+    else:
+        tier_index = TIER_ORDER.index(entry["tier"]) if entry["tier"] in TIER_ORDER else 0
+        base = tier_index * 400 + DIVISION_ORDER.get(entry["division"], 0) * 100
+    return base + entry["lp"]
+
+def resolve_lol_target(interaction: discord.Interaction, name, member, region, default_to_caller: bool = True):
+    """Same lookup rules as /lp: an explicit Riot ID wins, otherwise use a
+    registered member's stored account (the caller, if default_to_caller).
+    Returns (name, region, error_message) — error_message is None on success."""
+    if name is not None:
+        return name, (region or "na1"), None
+    if member is None and not default_to_caller:
+        return None, None, "Please provide a second player (a registered member or a Riot ID)."
+    target = member or interaction.user
+    entry = load_players().get(str(interaction.guild_id), {}).get(str(target.id))
+    if not entry:
+        who = "You aren't" if target.id == interaction.user.id else f"{target.mention} isn't"
+        return None, None, f"{who} registered. Use `/register` first, or provide a Riot ID directly."
+    return entry["name"], (region or entry["region"]), None
 
 async def fetch_profile_icon_id(puuid: str, region: str) -> int | None:
     """Fetch just the summoner's profile icon ID. Returns None (never
@@ -470,17 +508,19 @@ async def find_champion_by_name(query: str) -> tuple[str, dict] | None:
     return None
 
 # ==================== MATCH HISTORY (Match-V5) ====================
-async def fetch_last_ranked_match(puuid: str, region: str) -> dict | None:
-    """Fetch champion/KDA details for the player's most recent Ranked Solo/Duo
-    match. Returns None (never raises) if match data can't be retrieved —
-    this is supplementary flavor for the auto-update announcement, not
-    something that should ever block it."""
+async def fetch_last_ranked_match(puuid: str, region: str, ranked_only: bool = True) -> dict | None:
+    """Fetch champion/KDA/stat details for the player's most recent match
+    (Ranked Solo/Duo only by default; pass ranked_only=False to include any
+    queue, e.g. for /lastgame). Returns None (never raises) if match data
+    can't be retrieved — this is supplementary flavor for announcements, not
+    something that should ever block them."""
     regional = PLATFORM_TO_REGIONAL[region]
     headers = {"X-Riot-Token": RIOT_API_KEY}
+    queue_filter = "queue=420&" if ranked_only else ""
     try:
         ids_url = (
             f"https://{regional}.api.riotgames.com/lol/match/v5/matches/by-puuid/"
-            f"{puuid}/ids?queue=420&start=0&count=1"
+            f"{puuid}/ids?{queue_filter}start=0&count=1"
         )
         ids_resp = requests.get(ids_url, headers=headers)
         ids_resp.raise_for_status()
@@ -500,15 +540,35 @@ async def fetch_last_ranked_match(puuid: str, region: str) -> dict | None:
         if not participant:
             return None
 
+        info = match_data["info"]
+        team_kills = sum(
+            p.get("kills", 0) for p in info["participants"] if p.get("teamId") == participant.get("teamId")
+        )
+        kills, assists = participant["kills"], participant["assists"]
+        kill_participation = ((kills + assists) / team_kills * 100) if team_kills else 0.0
+
+        # gameEndTimestamp can be missing on older matches; fall back to
+        # start time + duration so "played X ago" still works.
+        end_ms = info.get("gameEndTimestamp") or (info.get("gameCreation", 0) + info["gameDuration"] * 1000)
+
         return {
             "match_id": match_id,
             "champion_key": participant["championName"],
             "champion": await get_champion_display_name(participant["championName"]),
-            "kills": participant["kills"],
+            "kills": kills,
             "deaths": participant["deaths"],
-            "assists": participant["assists"],
+            "assists": assists,
             "win": participant["win"],
-            "duration_seconds": match_data["info"]["gameDuration"],
+            "duration_seconds": info["gameDuration"],
+            "queue_id": info.get("queueId"),
+            "cs": participant.get("totalMinionsKilled", 0) + participant.get("neutralMinionsKilled", 0),
+            "damage": participant.get("totalDamageDealtToChampions", 0),
+            "vision_score": participant.get("visionScore", 0),
+            "gold": participant.get("goldEarned", 0),
+            "kill_participation": kill_participation,
+            "role": ROLE_DISPLAY.get(participant.get("teamPosition") or "", None),
+            "remake": bool(participant.get("gameEndedInEarlySurrender", False)),
+            "ended_at": int(end_ms // 1000) if end_ms else None,
         }
     except Exception:
         logging.warning(f"Could not fetch match details for puuid {puuid}", exc_info=True)
@@ -526,6 +586,36 @@ ROLE_DISPLAY = {
 # Each game costs 1 Riot API call, so this directly trades off /lp's cost
 # and latency against how representative the stats are.
 CHAMPION_STATS_GAME_COUNT = int(os.getenv("CHAMPION_STATS_GAME_COUNT", "10"))
+
+async def _fetch_match_json(match_id: str, regional: str, headers: dict) -> dict | None:
+    match_url = f"https://{regional}.api.riotgames.com/lol/match/v5/matches/{match_id}"
+    resp = await asyncio.to_thread(requests.get, match_url, headers=headers)
+    return resp.json() if resp.ok else None
+
+async def fetch_ranked_match_jsons(puuid: str, region: str, count: int) -> list[dict]:
+    """Full Match-V5 payloads for the player's last `count` Ranked Solo/Duo
+    games, newest first. Costs count + 1 Riot API calls. Raises
+    requests.HTTPError if the match-id lookup itself fails; individual
+    matches that fail to load are simply skipped."""
+    regional = PLATFORM_TO_REGIONAL[region]
+    headers = {"X-Riot-Token": RIOT_API_KEY}
+    ids_url = (
+        f"https://{regional}.api.riotgames.com/lol/match/v5/matches/by-puuid/"
+        f"{puuid}/ids?queue=420&start=0&count={count}"
+    )
+    ids_resp = await asyncio.to_thread(requests.get, ids_url, headers=headers)
+    ids_resp.raise_for_status()
+    match_ids = ids_resp.json()
+    if not match_ids:
+        return []
+    matches = await asyncio.gather(*[_fetch_match_json(mid, regional, headers) for mid in match_ids])
+    return [m for m in matches if m]  # gather preserves order, so still newest first
+
+def find_participant(match_json: dict, puuid: str) -> dict | None:
+    return next((p for p in match_json["info"]["participants"] if p["puuid"] == puuid), None)
+
+def is_remake(match_json: dict, participant: dict) -> bool:
+    return bool(participant.get("gameEndedInEarlySurrender")) and match_json["info"]["gameDuration"] < 300
 
 async def _fetch_match_participant(match_id: str, regional: str, headers: dict, puuid: str):
     match_url = f"https://{regional}.api.riotgames.com/lol/match/v5/matches/{match_id}"
@@ -638,6 +728,15 @@ async def on_ready():
     if not check_digests.is_running():
         check_digests.start()
         logging.info(f"Started LP digest check loop (every {DIGEST_CHECK_INTERVAL_MINUTES} min).")
+    if not sync_rank_roles_loop.is_running():
+        sync_rank_roles_loop.start()
+        logging.info(f"Started rank role sync loop (every {ROLE_SYNC_INTERVAL_MINUTES} min).")
+
+    # Warm the item cache in the background so /item autocomplete has data
+    # right away instead of waiting for the first /item call.
+    warm_task = asyncio.create_task(ensure_item_data())
+    _background_tasks.add(warm_task)
+    warm_task.add_done_callback(_background_tasks.discard)
 
     await refresh_all_capabilities_messages()
 
@@ -945,6 +1044,154 @@ async def tftleaderboard(interaction: discord.Interaction):
         embed.set_thumbnail(url=get_rank_emblem_url(results[0][2]["tier"]))
         await interaction.followup.send(embed=embed)
 
+# ==================== MATCH LOOKUPS ====================
+@tree.command(name="matchhistory", description="Show a player's recent Ranked Solo/Duo games")
+@app_commands.describe(
+    name="Riot ID (GameName#Tag) — leave blank to use your (or member's) registered account",
+    member="A registered Discord member to check instead of yourself (ignored if 'name' is given)",
+    region="Platform region — leave blank to use the registered region, or a default of na1",
+    games="How many games to show (1-10, default 5)"
+)
+async def matchhistory(
+    interaction: discord.Interaction,
+    name: str = None,
+    member: discord.Member = None,
+    region: str = None,
+    games: app_commands.Range[int, 1, 10] = 5,
+):
+    await interaction.response.defer(thinking=True)
+
+    if not RIOT_API_KEY:
+        await interaction.followup.send("❌ No RIOT_API_KEY found!")
+        return
+
+    name, region, error = resolve_lol_target(interaction, name, member, region)
+    if error:
+        await interaction.followup.send(f"❌ {error}")
+        return
+
+    try:
+        puuid = await fetch_puuid(name, region)
+        matches = await fetch_ranked_match_jsons(puuid, region.lower(), games)
+    except LPLookupError as e:
+        await interaction.followup.send(f"❌ {e}")
+        return
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        await interaction.followup.send(f"❌ Riot API error ({status}). Try again shortly.")
+        return
+    except Exception as e:
+        logging.exception("Unexpected error in /matchhistory")
+        await interaction.followup.send(f"❌ Error: {str(e)}")
+        return
+
+    if not matches:
+        await interaction.followup.send(f"❌ No recent Ranked Solo/Duo games found for **{name}**.")
+        return
+
+    lines = []
+    wins = losses = 0
+    for match in matches:
+        p = find_participant(match, puuid)
+        if not p:
+            continue
+        info = match["info"]
+        champ = await get_champion_display_name(p["championName"])
+        mins, secs = divmod(info["gameDuration"], 60)
+
+        if is_remake(match, p):
+            icon = "⚪"
+        elif p["win"]:
+            icon = "🟢"
+            wins += 1
+        else:
+            icon = "🔴"
+            losses += 1
+
+        when = f" • <t:{info['gameEndTimestamp'] // 1000}:R>" if info.get("gameEndTimestamp") else ""
+        lines.append(f"{icon} **{champ}** — {p['kills']}/{p['deaths']}/{p['assists']} • {mins}:{secs:02d}{when}")
+
+    embed = discord.Embed(
+        title=f"{name} — Recent Ranked Games",
+        description="\n".join(lines)[:4096],
+        color=0x5865F2
+    )
+    embed.set_footer(text=f"Last {len(lines)} games: {wins}W {losses}L ({region.upper()})")
+    await interaction.followup.send(embed=embed)
+
+@tree.command(name="compare", description="Compare two players' ranked stats side by side")
+@app_commands.describe(
+    other_member="The registered Discord member to compare against",
+    other_name="Or a Riot ID (GameName#Tag) to compare against instead",
+    member="First player, if not you (a registered Discord member)",
+    name="Or a Riot ID for the first player instead",
+    region="Region for any Riot IDs you type in (registered players use their own; default na1)"
+)
+async def compare(
+    interaction: discord.Interaction,
+    other_member: discord.Member = None,
+    other_name: str = None,
+    member: discord.Member = None,
+    name: str = None,
+    region: str = None,
+):
+    await interaction.response.defer(thinking=True)
+
+    if not RIOT_API_KEY:
+        await interaction.followup.send("❌ No RIOT_API_KEY found!")
+        return
+
+    name1, region1, error = resolve_lol_target(interaction, name, member, region)
+    if error:
+        await interaction.followup.send(f"❌ {error}")
+        return
+    name2, region2, error = resolve_lol_target(interaction, other_name, other_member, region, default_to_caller=False)
+    if error:
+        await interaction.followup.send(f"❌ {error}")
+        return
+
+    if (name1.lower(), region1.lower()) == (name2.lower(), region2.lower()):
+        await interaction.followup.send("❌ Pick two different players to compare.")
+        return
+
+    results = await asyncio.gather(
+        fetch_ranked_solo(name1, region1),
+        fetch_ranked_solo(name2, region2),
+        return_exceptions=True,
+    )
+
+    for result in results:
+        if isinstance(result, LPLookupError):
+            await interaction.followup.send(f"❌ {result}")
+            return
+        if isinstance(result, requests.exceptions.HTTPError):
+            status = result.response.status_code if result.response is not None else "?"
+            await interaction.followup.send(f"❌ Riot API error ({status}). Try again shortly.")
+            return
+        if isinstance(result, Exception):
+            logging.error(f"Unexpected error in /compare: {result}", exc_info=result)
+            await interaction.followup.send(f"❌ Error: {str(result)}")
+            return
+
+    data1, data2 = results
+    gap = approx_total_lp(data1) - approx_total_lp(data2)
+    if gap == 0:
+        headline, leader = "Dead even.", data1
+    else:
+        winner_name, leader = (name1, data1) if gap > 0 else (name2, data2)
+        headline = f"**{winner_name}** is ahead by about **{abs(gap)} LP**."
+
+    embed = discord.Embed(title=f"⚔️ {name1} vs {name2}", description=headline, color=get_rank_color(leader["tier"]))
+    for label, d in ((name1, data1), (name2, data2)):
+        division = "" if d["tier"] in APEX_TIERS else f" {d['division']}"
+        embed.add_field(
+            name=label,
+            value=f"{d['tier'].title()}{division} • {d['lp']} LP\n{d['wins']}W - {d['losses']}L\n{d['wr']:.1f}% win rate",
+            inline=True
+        )
+    embed.set_footer(text="LP gap is approximate across tiers and divisions")
+    await interaction.followup.send(embed=embed)
+
 # ==================== EXTRA LOOKUPS ====================
 QUEUE_NAMES = {
     400: "Normal (Draft)",
@@ -1076,6 +1323,284 @@ async def livegame(interaction: discord.Interaction, name: str, region: str = "n
     )
     embed.set_thumbnail(url=get_champion_icon_url_by_id(participant["championId"]))
     await interaction.followup.send(embed=embed)
+
+# ==================== LAST GAME ====================
+def resolve_registered_lol_player(interaction: discord.Interaction, name: str | None, member: discord.Member | None, region: str | None):
+    """Shared 'who did they mean?' logic for commands that take either an
+    explicit Riot ID or fall back to a registered Discord member (the caller
+    by default). Returns (name, region, error_message); error_message is
+    None on success."""
+    if name is not None:
+        return name, (region or "na1"), None
+
+    target = member or interaction.user
+    entry = load_players().get(str(interaction.guild_id), {}).get(str(target.id))
+    if not entry:
+        who = "You aren't" if target.id == interaction.user.id else f"{target.mention} isn't"
+        return None, None, f"❌ {who} registered. Use `/register` first, or provide a Riot ID directly."
+    return entry["name"], (region or entry["region"]), None
+
+@tree.command(name="lastgame", description="Show a detailed breakdown of a player's most recent game")
+@app_commands.describe(
+    name="Riot ID in the form GameName#Tag — leave blank to use your (or member's) registered account",
+    member="A registered Discord member to check instead of yourself (ignored if 'name' is given)",
+    region="Platform region — leave blank to use the registered region, or a default of na1",
+    ranked="Only look at Ranked Solo/Duo games (default: any queue)"
+)
+async def lastgame(interaction: discord.Interaction, name: str = None, member: discord.Member = None, region: str = None, ranked: bool = False):
+    await interaction.response.defer(thinking=True)
+
+    if not RIOT_API_KEY:
+        await interaction.followup.send("❌ No RIOT_API_KEY found!")
+        return
+
+    name, region, error = resolve_registered_lol_player(interaction, name, member, region)
+    if error:
+        await interaction.followup.send(error)
+        return
+    region = region.lower()
+
+    try:
+        puuid = await fetch_puuid(name, region)
+    except LPLookupError as e:
+        await interaction.followup.send(f"❌ {e}")
+        return
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        await interaction.followup.send(f"❌ Riot API error ({status}). Try again shortly.")
+        return
+    except Exception as e:
+        logging.exception("Unexpected error in /lastgame")
+        await interaction.followup.send(f"❌ Error: {str(e)}")
+        return
+
+    match = await fetch_last_ranked_match(puuid, region, ranked_only=ranked)
+    if not match:
+        scope = "ranked Solo/Duo " if ranked else ""
+        await interaction.followup.send(
+            f"❌ Couldn't find a recent {scope}game for **{name}** "
+            f"(or Riot's match data isn't responding — try again shortly)."
+        )
+        return
+
+    kills, deaths, assists = match["kills"], match["deaths"], match["assists"]
+    duration = match["duration_seconds"]
+    mins, secs = divmod(duration, 60)
+
+    if match["remake"]:
+        title_prefix, color = "⚪ Remake", 0x95A5A6
+    elif match["win"]:
+        title_prefix, color = "🟢 Victory", 0x2ECC71
+    else:
+        title_prefix, color = "🔴 Defeat", 0xE74C3C
+
+    if deaths == 0 and (kills + assists) > 0:
+        kda_ratio = "Perfect"
+    else:
+        kda_ratio = f"{(kills + assists) / max(deaths, 1):.2f}"
+    cs_per_min = (match["cs"] / (duration / 60)) if duration > 0 else 0.0
+
+    details = [QUEUE_NAMES.get(match["queue_id"], "Other mode")]
+    if match["role"]:
+        details.append(match["role"])
+    details.append(f"{mins}:{secs:02d}")
+    if match["ended_at"]:
+        details.append(f"<t:{match['ended_at']}:R>")
+
+    embed = discord.Embed(
+        title=f"{title_prefix} — {match['champion']}",
+        description=" • ".join(details),
+        color=color
+    )
+    embed.set_author(name=f"{name} ({region.upper()})")
+    embed.add_field(name="KDA", value=f"{kills}/{deaths}/{assists}\n{kda_ratio} ratio", inline=True)
+    embed.add_field(name="CS", value=f"{match['cs']}\n{cs_per_min:.1f}/min", inline=True)
+    embed.add_field(name="Kill Part.", value=f"{match['kill_participation']:.0f}%", inline=True)
+    embed.add_field(name="Damage", value=f"{match['damage']:,}", inline=True)
+    embed.add_field(name="Vision", value=str(match["vision_score"]), inline=True)
+    embed.add_field(name="Gold", value=f"{match['gold']:,}", inline=True)
+
+    icon_url = await get_champion_icon_url(match["champion_key"])
+    if icon_url:
+        embed.set_thumbnail(url=icon_url)
+
+    await interaction.followup.send(embed=embed)
+
+# ==================== ITEM LOOKUP (Data Dragon) ====================
+# Item data comes from Riot's Data Dragon (the official static-data CDN).
+# Not a Riot API call, so it costs nothing against your rate limit. The
+# schema used here (name / plaintext / description / gold / from / into /
+# maps) matches Data Dragon's documented item format, but this has not been
+# run against the live host from the build environment — if /item ever
+# misbehaves, the log lines in _load_item_data_sync say what came back.
+DDRAGON_VERSIONS_URL = "https://ddragon.leagueoflegends.com/api/versions.json"
+DDRAGON_ITEM_URL = "https://ddragon.leagueoflegends.com/cdn/{version}/data/en_US/item.json"
+DDRAGON_ITEM_ICON_URL = "https://ddragon.leagueoflegends.com/cdn/{version}/img/item/{item_id}.png"
+SUMMONERS_RIFT_MAP_ID = "11"
+
+_ITEM_CACHE = {"loaded_at": 0.0, "version": None, "items": {}}
+_background_tasks = set()
+
+def _clean_item_text(raw: str) -> str:
+    """Data Dragon descriptions are HTML-ish (<br>, <stats>, <attention>...).
+    Turn <br> into newlines, strip the rest, unescape entities, tidy spacing."""
+    text = re.sub(r"<br\s*/?>", "\n", raw or "", flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+def _load_item_data_sync(force: bool = False) -> None:
+    now = datetime.now(timezone.utc).timestamp()
+    if not force and _ITEM_CACHE["items"] and now - _ITEM_CACHE["loaded_at"] < ITEM_CACHE_TTL_SECONDS:
+        return
+    try:
+        versions_resp = requests.get(DDRAGON_VERSIONS_URL, timeout=10)
+        versions_resp.raise_for_status()
+        version = versions_resp.json()[0]
+
+        item_resp = requests.get(DDRAGON_ITEM_URL.format(version=version), timeout=15)
+        item_resp.raise_for_status()
+        payload = item_resp.json()
+
+        # Normally the items live under "data", keyed by item ID; tolerate a
+        # bare ID->item mapping too rather than assuming.
+        raw_items = payload.get("data", payload)
+        items = {
+            str(item_id): entry
+            for item_id, entry in raw_items.items()
+            if isinstance(entry, dict) and entry.get("name")
+        }
+        if not items:
+            logging.warning(f"Item data fetched but no items parsed. Top-level keys: {list(payload.keys())[:10]}")
+            return
+
+        _ITEM_CACHE.update(loaded_at=now, version=version, items=items)
+        logging.info(f"Loaded {len(items)} items from Data Dragon (patch {version}).")
+    except Exception:
+        logging.warning("Could not load item data from Data Dragon", exc_info=True)
+
+async def ensure_item_data() -> bool:
+    await asyncio.to_thread(_load_item_data_sync)
+    return bool(_ITEM_CACHE["items"])
+
+def _item_is_primary(entry: dict) -> bool:
+    """Prefer items you can actually buy on Summoner's Rift over the many
+    mode-specific copies that share names."""
+    gold = entry.get("gold") or {}
+    maps = entry.get("maps") or {}
+    return (
+        bool(gold.get("purchasable", True))
+        and bool(maps.get(SUMMONERS_RIFT_MAP_ID, True))
+        and entry.get("inStore", True) is not False
+    )
+
+def find_items_by_name(query: str) -> list:
+    q = query.strip().lower()
+    if not q:
+        return []
+    items = _ITEM_CACHE["items"]
+    exact = [(i, e) for i, e in items.items() if e["name"].lower() == q]
+    pool = exact or [(i, e) for i, e in items.items() if q in e["name"].lower()]
+    pool.sort(key=lambda ie: (not _item_is_primary(ie[1]), len(ie[1]["name"]), ie[1]["name"]))
+    return pool
+
+def _item_name(item_id) -> str:
+    return _ITEM_CACHE["items"].get(str(item_id), {}).get("name", f"Item {item_id}")
+
+def _format_item_names(item_ids: list, with_counts: bool = False, limit: int | None = None) -> str:
+    order, counts = [], {}
+    for item_id in item_ids:
+        n = _item_name(item_id)
+        if n not in counts:
+            counts[n] = 0
+            order.append(n)
+        counts[n] += 1
+    labels = [f"{n} ×{counts[n]}" if with_counts and counts[n] > 1 else n for n in order]
+    if limit is not None and len(labels) > limit:
+        extra = len(labels) - limit
+        labels = labels[:limit] + [f"…and {extra} more"]
+    return ", ".join(labels)
+
+@tree.command(name="item", description="Look up a League of Legends item: cost, stats and build path")
+@app_commands.describe(name="Item name (e.g. 'Infinity Edge')")
+async def item_info(interaction: discord.Interaction, name: str):
+    await interaction.response.defer(thinking=True)
+
+    if not await ensure_item_data():
+        await interaction.followup.send("❌ Couldn't load item data right now. Try again shortly.")
+        return
+
+    matches = find_items_by_name(name)
+    if not matches:
+        await interaction.followup.send(f"❌ No item found matching '{name}'.")
+        return
+
+    item_id, entry = matches[0]
+    items = _ITEM_CACHE["items"]
+    version = _ITEM_CACHE["version"]
+    gold = entry.get("gold") or {}
+
+    tagline = (entry.get("plaintext") or "").strip()
+    body = _clean_item_text(entry.get("description", ""))
+    description = "\n\n".join(part for part in (f"*{tagline}*" if tagline else "", body) if part)
+    if len(description) > 1800:
+        description = description[:1800].rsplit(" ", 1)[0] + "…"
+
+    embed = discord.Embed(
+        title=entry["name"],
+        description=description or "No description available.",
+        color=0xC89B3C
+    )
+    embed.set_thumbnail(url=DDRAGON_ITEM_ICON_URL.format(version=version, item_id=item_id))
+
+    components = entry.get("from") or []
+    if gold.get("total") is not None:
+        cost = f"{gold['total']:,}g"
+        if components and gold.get("base"):
+            cost += f" ({gold['base']:,}g recipe)"
+        embed.add_field(name="Cost", value=cost, inline=True)
+    if gold.get("sell") is not None:
+        embed.add_field(name="Sells for", value=f"{gold['sell']:,}g", inline=True)
+
+    if components:
+        embed.add_field(name="Builds from", value=_format_item_names(components, with_counts=True)[:1024], inline=False)
+
+    into = entry.get("into") or []
+    primary_into = [i for i in into if _item_is_primary(items.get(str(i), {}))] or into
+    if primary_into:
+        embed.add_field(name="Builds into", value=_format_item_names(primary_into, limit=8)[:1024], inline=False)
+
+    footer = [f"Patch {version}"]
+    if gold.get("purchasable") is False:
+        footer.append("Not purchasable")
+    other_names = []
+    for _, e in matches[1:]:
+        if e["name"] != entry["name"] and e["name"] not in other_names:
+            other_names.append(e["name"])
+    if other_names and entry["name"].lower() != name.strip().lower():
+        footer.append("Other matches: " + ", ".join(other_names[:4]))
+    embed.set_footer(text=" • ".join(footer)[:2048])
+
+    await interaction.followup.send(embed=embed)
+
+@item_info.autocomplete("name")
+async def item_name_autocomplete(interaction: discord.Interaction, current: str):
+    items = _ITEM_CACHE["items"]
+    if not items:
+        return []  # cache still warming; the command itself will load it
+    q = current.strip().lower()
+    seen, choices = set(), []
+    for _, e in sorted(items.items(), key=lambda ie: ie[1]["name"]):
+        n = e["name"]
+        if n in seen or not _item_is_primary(e) or (q and q not in n.lower()):
+            continue
+        seen.add(n)
+        choices.append(app_commands.Choice(name=n[:100], value=n[:100]))
+        if len(choices) >= 25:
+            break
+    return choices
 
 @tree.command(name="freerotation", description="Show this week's free champion rotation")
 @app_commands.describe(region="Platform region (default na1)")
@@ -1367,6 +1892,11 @@ async def register(interaction: discord.Interaction, name: str, region: str = "n
     players[guild_id][str(interaction.user.id)] = entry
     save_players(players)
 
+    # Give them the matching rank role right away (does nothing unless rank
+    # roles have been turned on for this server with /setrankroles).
+    if baseline and isinstance(interaction.user, discord.Member):
+        await apply_rank_role(interaction.guild, interaction.user, baseline["tier"])
+
     embed = discord.Embed(
         title="✅ Registered",
         description=f"Linked to {interaction.user.mention} — you'll now show up on `/leaderboard`.",
@@ -1627,6 +2157,223 @@ async def forcedigest_error(interaction: discord.Interaction, error: app_command
         except discord.HTTPException:
             pass
 
+# ==================== RANK ROLES ====================
+# Gives each registered player a Discord role matching their current
+# Solo/Duo tier. Per-guild config: "rank_roles_enabled" (bool) and
+# "rank_roles" ({TIER: role_id}). Members that aren't in the cache are
+# fetched from Discord directly, so this doesn't need the privileged
+# "members" intent.
+
+async def get_guild_member(guild: discord.Guild, user_id: int) -> discord.Member | None:
+    member = guild.get_member(user_id)
+    if member is not None:
+        return member
+    try:
+        return await guild.fetch_member(user_id)
+    except discord.NotFound:
+        return None  # no longer in the server
+    except discord.HTTPException:
+        logging.warning(f"Could not fetch member {user_id} in guild {guild.id}", exc_info=True)
+        return None
+
+def _rank_role_config(guild: discord.Guild) -> dict | None:
+    cfg = load_config().get(str(guild.id), {})
+    if not cfg.get("rank_roles_enabled") or not cfg.get("rank_roles"):
+        return None
+    return cfg["rank_roles"]
+
+async def apply_rank_role(guild: discord.Guild, member: discord.Member, tier: str) -> bool:
+    """Give `member` the role for `tier` and take away any other rank role.
+    Never raises. Returns True if they end up with the right role, False if
+    rank roles are off, the role is gone, or Discord refused."""
+    role_map = _rank_role_config(guild)
+    if not role_map or tier not in role_map:
+        return False
+
+    target = guild.get_role(role_map[tier])
+    if target is None:
+        logging.warning(f"Rank role for {tier} no longer exists in guild {guild.id} — run /setrankroles again.")
+        return False
+
+    rank_role_ids = set(role_map.values())
+    stale = [r for r in member.roles if r.id in rank_role_ids and r.id != target.id]
+    try:
+        if stale:
+            await member.remove_roles(*stale, reason="LP Tracker: rank changed")
+        if target not in member.roles:
+            await member.add_roles(target, reason="LP Tracker: rank role")
+        return True
+    except discord.Forbidden:
+        logging.warning(f"Not allowed to manage rank roles in guild {guild.id} (is my role above the rank roles?)")
+        return False
+    except discord.HTTPException:
+        logging.warning(f"Discord error while setting rank role for member {member.id}", exc_info=True)
+        return False
+
+async def remove_rank_roles(guild: discord.Guild, member: discord.Member) -> None:
+    role_map = _rank_role_config(guild)
+    if not role_map:
+        return
+    rank_role_ids = set(role_map.values())
+    held = [r for r in member.roles if r.id in rank_role_ids]
+    if not held:
+        return
+    try:
+        await member.remove_roles(*held, reason="LP Tracker: unregistered")
+    except discord.HTTPException:
+        logging.warning(f"Could not remove rank roles from member {member.id}", exc_info=True)
+
+async def sync_rank_roles_for_guild(guild: discord.Guild) -> dict:
+    """Look up every registered player in this server and apply their rank
+    role. Costs 2 Riot API calls per registered player. Unranked players
+    and people who left the server are skipped, not stripped."""
+    counts = {"synced": 0, "skipped": 0, "failed": 0}
+    players = load_players().get(str(guild.id), {})
+
+    for user_id, info in players.items():
+        member = await get_guild_member(guild, int(user_id))
+        if member is None:
+            counts["skipped"] += 1
+            continue
+        try:
+            data = await fetch_ranked_solo(info["name"], info["region"])
+            ok = await apply_rank_role(guild, member, data["tier"])
+            counts["synced" if ok else "failed"] += 1
+        except LPLookupError:
+            counts["skipped"] += 1
+        except Exception:
+            logging.warning(f"Rank role sync: could not process {info['name']}", exc_info=True)
+            counts["failed"] += 1
+        await asyncio.sleep(0.3)
+
+    return counts
+
+@tasks.loop(minutes=ROLE_SYNC_INTERVAL_MINUTES)
+async def sync_rank_roles_loop():
+    config = load_config()
+    for guild_id, guild_cfg in list(config.items()):
+        if guild_id == "_meta" or not guild_cfg.get("rank_roles_enabled"):
+            continue
+        guild = bot.get_guild(int(guild_id))
+        if guild is None:
+            continue
+        try:
+            counts = await sync_rank_roles_for_guild(guild)
+            logging.info(f"Rank role sync for guild {guild_id}: {counts}")
+        except Exception:
+            logging.exception(f"Rank role sync failed for guild {guild_id}")
+
+@sync_rank_roles_loop.before_loop
+async def before_sync_rank_roles_loop():
+    await bot.wait_until_ready()
+
+@tree.command(name="setrankroles", description="Turn automatic rank roles on or off for registered players (admin only)")
+@app_commands.describe(enabled="On (default) creates the tier roles and starts assigning them; off stops, leaving roles in place")
+@app_commands.checks.has_permissions(manage_guild=True, manage_roles=True)
+async def setrankroles(interaction: discord.Interaction, enabled: bool = True):
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+    guild_id = str(guild.id)
+    config = load_config()
+    config.setdefault(guild_id, {})
+
+    if not enabled:
+        config[guild_id]["rank_roles_enabled"] = False
+        save_config(config)
+        await interaction.followup.send(
+            "✅ Automatic rank roles are off. The existing roles are left in place — "
+            "delete them in Server Settings if you don't want them, or run this again to turn it back on.",
+            ephemeral=True
+        )
+        return
+
+    if not guild.me.guild_permissions.manage_roles:
+        await interaction.followup.send("❌ I need the 'Manage Roles' permission to create and assign rank roles.", ephemeral=True)
+        return
+
+    role_map = {}
+    created, reused, too_high = [], [], []
+    try:
+        for tier in TIER_ORDER:
+            role_name = f"{RANK_ROLE_PREFIX}{tier.title()}"
+            role = discord.utils.get(guild.roles, name=role_name)
+            if role is None:
+                role = await guild.create_role(
+                    name=role_name,
+                    colour=discord.Colour(get_rank_color(tier)),
+                    reason="LP Tracker rank roles"
+                )
+                created.append(role_name)
+            else:
+                reused.append(role_name)
+                if role >= guild.me.top_role:
+                    too_high.append(role_name)
+            role_map[tier] = role.id
+    except discord.Forbidden:
+        await interaction.followup.send("❌ Discord refused to create the roles — check my permissions and try again.", ephemeral=True)
+        return
+    except discord.HTTPException:
+        logging.exception("Error creating rank roles")
+        await interaction.followup.send("❌ Something went wrong creating the roles — try again shortly.", ephemeral=True)
+        return
+
+    config = load_config()
+    config.setdefault(guild_id, {})
+    config[guild_id]["rank_roles"] = role_map
+    config[guild_id]["rank_roles_enabled"] = True
+    save_config(config)
+
+    counts = await sync_rank_roles_for_guild(guild)
+
+    lines = [
+        f"✅ Rank roles are on. Created {len(created)} new role(s), reused {len(reused)} that already existed.",
+        f"First sync: {counts['synced']} updated, {counts['skipped']} skipped (unranked or left the server), {counts['failed']} failed.",
+        f"Roles re-sync every {ROLE_SYNC_INTERVAL_MINUTES} min, and right away when someone registers.",
+    ]
+    if too_high:
+        lines.append(f"⚠️ My role sits below these existing roles, so I can't assign them: {', '.join(too_high)}.")
+    if counts["failed"]:
+        lines.append("Failures usually mean my role is below the rank roles — drag it above them in Server Settings → Roles.")
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+@setrankroles.error
+async def setrankroles_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ You need the 'Manage Server' and 'Manage Roles' permissions to set up rank roles.", ephemeral=True
+        )
+    else:
+        logging.error(f"Error in /setrankroles: {error}", exc_info=error)
+
+@tree.command(name="forcerolesync", description="Re-sync everyone's rank role right now (admin only)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def forcerolesync(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    if _rank_role_config(interaction.guild) is None:
+        await interaction.followup.send("❌ Rank roles aren't turned on here — use `/setrankroles` first.", ephemeral=True)
+        return
+
+    counts = await sync_rank_roles_for_guild(interaction.guild)
+    await interaction.followup.send(
+        f"✅ Synced: {counts['synced']} updated, {counts['skipped']} skipped, {counts['failed']} failed.",
+        ephemeral=True
+    )
+
+@forcerolesync.error
+async def forcerolesync_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ You need the 'Manage Server' permission to force a role sync.", ephemeral=True
+        )
+    else:
+        logging.error(f"Error in /forcerolesync: {error}", exc_info=error)
+        try:
+            await interaction.followup.send("❌ Something went wrong — check the bot logs for details.", ephemeral=True)
+        except discord.HTTPException:
+            pass
+
 @tree.command(name="setpatchchannel", description="Set the channel for automatic patch notes announcements (admin only)")
 @app_commands.describe(channel="The channel where new patch notes should be posted")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -1683,7 +2430,7 @@ async def settftchannel_error(interaction: discord.Interaction, error: app_comma
 # pulled live from the tree below, so wording never goes stale, but a brand
 # new command won't appear here until it's added to one of these lists.
 CAPABILITIES_CATEGORIES = {
-    "🎮 League of Legends": ["lp", "register", "unregister", "leaderboard", "mastery", "livegame", "freerotation", "serverstatus", "champion"],
+    "🎮 League of Legends": ["lp", "lastgame", "matchhistory", "compare", "register", "unregister", "leaderboard", "mastery", "livegame", "freerotation", "serverstatus", "champion", "item"],
     "🧩 Teamfight Tactics": ["tftlp", "tftregister", "tftunregister", "tftleaderboard"],
     "📰 News": ["news", "patchnotes"],
 }
@@ -1811,6 +2558,11 @@ async def unregister(interaction: discord.Interaction):
     del players[guild_id][str(interaction.user.id)]
     save_players(players)
     await interaction.response.send_message("✅ You've been removed from the leaderboard.", ephemeral=True)
+
+    # Strip any rank role afterwards (the reply above has to go out within
+    # Discord's 3-second window, so this comes second).
+    if isinstance(interaction.user, discord.Member):
+        await remove_rank_roles(interaction.guild, interaction.user)
 
 # ==================== LEADERBOARD ====================
 @tree.command(name="leaderboard", description="Show the ranked LP leaderboard for registered server members")
