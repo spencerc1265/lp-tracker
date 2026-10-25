@@ -1896,6 +1896,9 @@ async def register(interaction: discord.Interaction, name: str, region: str = "n
     # roles have been turned on for this server with /setrankroles).
     if baseline and isinstance(interaction.user, discord.Member):
         await apply_rank_role(interaction.guild, interaction.user, baseline["tier"])
+    # Match their nickname to their League name (no-op unless /setnicknames is on).
+    if isinstance(interaction.user, discord.Member):
+        await apply_nickname(interaction.guild, interaction.user, name)
 
     embed = discord.Embed(
         title="✅ Registered",
@@ -2555,6 +2558,7 @@ async def unregister(interaction: discord.Interaction):
     if guild_id not in players or str(interaction.user.id) not in players[guild_id]:
         await interaction.response.send_message("You're not registered here.", ephemeral=True)
         return
+    removed_name = players[guild_id][str(interaction.user.id)].get("name")
     del players[guild_id][str(interaction.user.id)]
     save_players(players)
     await interaction.response.send_message("✅ You've been removed from the leaderboard.", ephemeral=True)
@@ -2563,6 +2567,99 @@ async def unregister(interaction: discord.Interaction):
     # Discord's 3-second window, so this comes second).
     if isinstance(interaction.user, discord.Member):
         await remove_rank_roles(interaction.guild, interaction.user)
+        await reset_nickname(interaction.guild, interaction.user, info_name=removed_name)
+
+# ==================== AUTO NICKNAMES ====================
+# Sets a registered member's server nickname to their League game name
+# (the part before the #). Per-guild config: "nickname_sync_enabled".
+# Uses the name stored at /register, so it costs no Riot API calls.
+
+def league_nickname(riot_id: str) -> str:
+    return riot_id.split("#", 1)[0].strip()[:32]
+
+def _nickname_sync_enabled(guild: discord.Guild) -> bool:
+    return bool(load_config().get(str(guild.id), {}).get("nickname_sync_enabled"))
+
+async def apply_nickname(guild: discord.Guild, member: discord.Member, riot_id: str) -> str:
+    """Returns 'set', 'unchanged', 'off' or 'failed'. Never raises."""
+    if not _nickname_sync_enabled(guild):
+        return "off"
+    nick = league_nickname(riot_id)
+    if not nick:
+        return "failed"
+    if member.nick == nick:
+        return "unchanged"
+    try:
+        await member.edit(nick=nick, reason="LP Tracker: match League name")
+        return "set"
+    except discord.Forbidden:
+        # Server owner, or someone whose top role is above mine.
+        return "failed"
+    except discord.HTTPException:
+        logging.warning(f"Could not set nickname for member {member.id}", exc_info=True)
+        return "failed"
+
+async def reset_nickname(guild: discord.Guild, member: discord.Member, info_name: str | None) -> None:
+    """On unregister, clear the nickname only if it's the one we set."""
+    if not info_name or not _nickname_sync_enabled(guild):
+        return
+    if member.nick != league_nickname(info_name):
+        return
+    try:
+        await member.edit(nick=None, reason="LP Tracker: unregistered")
+    except discord.HTTPException:
+        logging.warning(f"Could not reset nickname for member {member.id}", exc_info=True)
+
+@tree.command(name="setnicknames", description="Auto-set registered players' nicknames to their League name (admin only)")
+@app_commands.describe(enabled="On (default) renames registered players now and when they register; off stops")
+@app_commands.checks.has_permissions(manage_guild=True, manage_nicknames=True)
+async def setnicknames(interaction: discord.Interaction, enabled: bool = True):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    guild_id = str(guild.id)
+
+    config = load_config()
+    config.setdefault(guild_id, {})
+    config[guild_id]["nickname_sync_enabled"] = enabled
+    save_config(config)
+
+    if not enabled:
+        await interaction.followup.send("✅ Auto nicknames are off. Existing nicknames are left as they are.", ephemeral=True)
+        return
+
+    if not guild.me.guild_permissions.manage_nicknames:
+        await interaction.followup.send("❌ I need the 'Manage Nicknames' permission first.", ephemeral=True)
+        return
+
+    counts = {"set": 0, "unchanged": 0, "failed": 0, "gone": 0}
+    for user_id, info in load_players().get(guild_id, {}).items():
+        member = await get_guild_member(guild, int(user_id))
+        if member is None:
+            counts["gone"] += 1
+            continue
+        result = await apply_nickname(guild, member, info["name"])
+        counts[result] += 1
+        await asyncio.sleep(0.3)
+
+    lines = [
+        f"✅ Auto nicknames are on. {counts['set']} renamed, {counts['unchanged']} already matched.",
+        "New registrations are renamed automatically.",
+    ]
+    if counts["failed"]:
+        lines.append(
+            f"⚠️ Couldn't rename {counts['failed']} member(s) — Discord never lets bots rename the server owner, "
+            "and my role must sit above the member's top role."
+        )
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+@setnicknames.error
+async def setnicknames_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ You need the 'Manage Server' and 'Manage Nicknames' permissions.", ephemeral=True
+        )
+    else:
+        logging.error(f"Error in /setnicknames: {error}", exc_info=error)
 
 # ==================== LEADERBOARD ====================
 @tree.command(name="leaderboard", description="Show the ranked LP leaderboard for registered server members")
